@@ -272,7 +272,7 @@ func (ms *MessageStore) Delete(sp SegmentPosition) error {
 
 	// Clean up fully-acked segments (not the current write segment).
 	if sp.Segment != ms.wfileID {
-		ackCount := uint32(ackFile.Size() / ackEntrySize)
+		ackCount := uint32(ackFile.Size() / ackEntrySize) //nolint:gosec // ack count bounded by segment message count
 		if ackCount >= ms.msgCount[sp.Segment] {
 			ms.cleanupSegment(sp.Segment)
 		}
