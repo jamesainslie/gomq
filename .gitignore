@@ -1,0 +1,34 @@
+# Binaries
+/gomq
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+coverage.out
+coverage.html
+coverage.txt
+
+# Build
+/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LavinMQ reference source (not part of our project)
+/lavinmq/
+
+# Data directory
+/data/
+/tmp/

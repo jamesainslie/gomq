@@ -1,0 +1,7 @@
+hash_fast: true
+hooks:
+  pre-commit:
+    - target: fmt:go
+    - target: lint:go
+  pre-push:
+    - target: test:all
