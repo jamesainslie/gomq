@@ -15,10 +15,11 @@ const readerBufSize = 65536
 // Reader reads AMQP frames from an io.Reader.
 // It enforces a maximum frame size and reuses a read buffer to minimize allocations.
 type Reader struct {
-	rd      *bufio.Reader
-	hdr     [frameHeaderSize]byte
-	buf     []byte // reusable payload buffer
-	maxSize uint32 // max frame size (negotiated)
+	rd          *bufio.Reader
+	hdr         [frameHeaderSize]byte
+	buf         []byte            // reusable payload buffer
+	maxSize     uint32            // max frame size (negotiated)
+	methodCache map[uint32]Method // reuse method objects for frequent methods
 }
 
 // NewReader creates a new frame reader with the given max frame size.
@@ -28,9 +29,10 @@ func NewReader(r io.Reader, maxSize uint32) *Reader {
 		maxSize = FrameMinSize
 	}
 	return &Reader{
-		rd:      bufio.NewReaderSize(r, readerBufSize),
-		buf:     make([]byte, 0, maxSize),
-		maxSize: maxSize,
+		rd:          bufio.NewReaderSize(r, readerBufSize),
+		buf:         make([]byte, 0, maxSize),
+		maxSize:     maxSize,
+		methodCache: make(map[uint32]Method),
 	}
 }
 
@@ -104,9 +106,17 @@ func (r *Reader) decodeMethodFrame(channel uint16, payload []byte) (Frame, error
 	methodID := binary.BigEndian.Uint16(payload[sizeUint16:sizeUint32])
 	combinedID := uint32(classID)<<classShift | uint32(methodID)
 
-	method, err := MethodByID(combinedID)
-	if err != nil {
-		return nil, fmt.Errorf("decode method frame: %w", err)
+	// Reuse cached method objects for high-frequency methods to avoid
+	// per-frame heap allocations. Safe because the read loop fully processes
+	// each frame before reading the next one of the same type.
+	method, ok := r.methodCache[combinedID]
+	if !ok {
+		var err error
+		method, err = MethodByID(combinedID)
+		if err != nil {
+			return nil, fmt.Errorf("decode method frame: %w", err)
+		}
+		r.methodCache[combinedID] = method
 	}
 
 	methodPayload := bytes.NewReader(payload[sizeUint32:])
