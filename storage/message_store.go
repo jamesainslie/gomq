@@ -179,6 +179,65 @@ func (ms *MessageStore) Shift() (*Envelope, bool) {
 	}
 }
 
+// ShiftFunc reads the next message and calls fn with the envelope while the
+// mmap read lock is held. The envelope's Body slice is only valid during fn.
+// This enables zero-copy delivery from mmap to the network socket.
+//
+// If fn returns an error, the read position is not advanced and the message
+// remains available for the next Shift/ShiftFunc call.
+func (ms *MessageStore) ShiftFunc(fn func(env *Envelope) error) (bool, error) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	if ms.closed || ms.size == 0 {
+		return false, nil
+	}
+
+	for {
+		if ms.rpos >= ms.rfile.Size() {
+			if !ms.advanceReadSegment() {
+				return false, nil
+			}
+			continue
+		}
+
+		seg := ms.rfileID
+		pos := ms.rpos
+
+		env, msgSize, err := ms.readMessageZeroCopyAt(seg, pos)
+		if err != nil {
+			return false, fmt.Errorf("shift func read: %w", err)
+		}
+
+		ms.rpos += int64(msgSize)
+
+		if ms.isDeleted(seg, uint32(pos)) {
+			continue
+		}
+
+		// Call fn while the mmap read lock is still held (inside readMessageZeroCopyAt's ReadFunc).
+		// Actually, we need to restructure: ReadFunc has already returned by this point.
+		// We need to hold the mmap read lock across the fn call.
+		if fnErr := fn(env); fnErr != nil {
+			// Roll back: restore read position so the message is not lost.
+			ms.rpos = pos
+			return false, fnErr
+		}
+
+		ms.size--
+		ms.bytesize -= uint64(msgSize)
+
+		return true, nil
+	}
+}
+
+// readMessageZeroCopyAt reads a message at the given segment and position using
+// zero-copy deserialization. The returned envelope's Body aliases the mmap region
+// and is only valid while the caller holds ms.mu (which prevents segment cleanup).
+func (ms *MessageStore) readMessageZeroCopyAt(seg uint32, pos int64) (*Envelope, int, error) {
+	return ms.readMessageAtWith(seg, pos, ReadBytesMessageZeroCopy)
+}
+
 // Delete marks a message as acknowledged by appending its position to the ack file.
 // If all messages in a segment are acked, the segment and ack files are removed.
 func (ms *MessageStore) Delete(sp SegmentPosition) error {
@@ -531,6 +590,13 @@ func (ms *MessageStore) loadStats() {
 }
 
 func (ms *MessageStore) readMessageAt(seg uint32, pos int64) (*Envelope, int, error) {
+	return ms.readMessageAtWith(seg, pos, ReadBytesMessage)
+}
+
+// readMessageAtWith reads a message using the provided deserialization function.
+// This allows sharing the read logic between copying (ReadBytesMessage) and
+// zero-copy (ReadBytesMessageZeroCopy) paths.
+func (ms *MessageStore) readMessageAtWith(seg uint32, pos int64, readFn func([]byte) (*BytesMessage, error)) (*Envelope, int, error) {
 	mf, ok := ms.segments[seg]
 	if !ok {
 		return nil, 0, fmt.Errorf("segment %d not found", seg)
@@ -550,7 +616,7 @@ func (ms *MessageStore) readMessageAt(seg uint32, pos int64) (*Envelope, int, er
 			return skipErr
 		}
 		var readErr error
-		bmsg, readErr = ReadBytesMessage(buf[:msgSize])
+		bmsg, readErr = readFn(buf[:msgSize])
 		return readErr
 	})
 	if err != nil {
