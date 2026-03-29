@@ -457,12 +457,9 @@ func TestGuarantee_NackRequeue(t *testing.T) {
 		}
 	}
 
-	// Consume again -- should get the requeued messages.
-	// NOTE: nack-requeue is not yet implemented in the broker (Queue.Reject
-	// always deletes regardless of the requeue flag). This test documents the
-	// expected behaviour and will start passing once the feature lands.
+	// Consume again -- should get the requeued messages with Redelivered=true.
 	redelivered := 0
-	timeout := time.After(2 * time.Second)
+	timeout := time.After(5 * time.Second)
 	for redelivered < msgCount {
 		select {
 		case msg := <-msgs:
@@ -474,9 +471,6 @@ func TestGuarantee_NackRequeue(t *testing.T) {
 				t.Fatalf("ack redelivered msg: %v", err)
 			}
 		case <-timeout:
-			if redelivered == 0 {
-				t.Skip("nack-requeue not yet implemented (Queue.Reject ignores requeue flag)")
-			}
 			t.Fatalf("timed out waiting for redelivered messages: got %d/%d", redelivered, msgCount)
 		}
 	}

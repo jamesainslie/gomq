@@ -52,6 +52,9 @@ type Queue struct {
 	fenceMu sync.Mutex
 	fences  []chan struct{} // per-Drain fence channels, signaled by writeLoop on nil sentinel
 
+	// Requeued messages waiting to be re-delivered (LIFO order, served first).
+	requeued []storage.SegmentPosition
+
 	// Limits parsed from arguments.
 	maxLength      int64  // 0 = unlimited (x-max-length)
 	maxLengthBytes int64  // 0 = unlimited (x-max-length-bytes)
@@ -276,11 +279,23 @@ func (q *Queue) publishToStore(msg *storage.Message) {
 }
 
 // Get shifts one message from the front of the queue (basic.get semantics).
+// Requeued messages are served first with the Redelivered flag set.
 // If noAck is true the message is considered immediately consumed. Returns
 // false when the queue is empty.
 func (q *Queue) Get(noAck bool) (*storage.Envelope, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	// Serve requeued messages first.
+	if env, ok := q.shiftRequeued(); ok {
+		q.deliverCount.Add(1)
+		if noAck {
+			if delErr := q.store.Delete(env.SegmentPosition); delErr == nil {
+				q.ackCount.Add(1)
+			}
+		}
+		return env, true
+	}
 
 	env, ok := q.store.Shift()
 	if !ok {
@@ -302,12 +317,29 @@ func (q *Queue) Get(noAck bool) (*storage.Envelope, bool) {
 }
 
 // GetFunc shifts one message from the front of the queue and calls fn with the
-// envelope. The envelope's Body may alias the mmap region and is only valid
-// during fn. If fn returns an error, the message is not consumed and remains
-// available. Returns false when the queue is empty.
+// envelope. Requeued messages are served first with the Redelivered flag set.
+// The envelope's Body may alias the mmap region and is only valid during fn.
+// If fn returns an error, the message is not consumed and remains available.
+// Returns false when the queue is empty.
 func (q *Queue) GetFunc(noAck bool, fn func(env *storage.Envelope) error) (bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	// Serve requeued messages first.
+	if env, ok := q.shiftRequeued(); ok {
+		if err := fn(env); err != nil {
+			// Put it back on requeue if delivery fails.
+			q.requeued = append(q.requeued, env.SegmentPosition)
+			return false, err
+		}
+		q.deliverCount.Add(1)
+		if noAck {
+			if delErr := q.store.Delete(env.SegmentPosition); delErr == nil {
+				q.ackCount.Add(1)
+			}
+		}
+		return true, nil
+	}
 
 	var sp storage.SegmentPosition
 	ok, err := q.store.ShiftFunc(func(env *storage.Envelope) error {
@@ -339,9 +371,17 @@ func (q *Queue) Ack(sp storage.SegmentPosition) error {
 	return nil
 }
 
-// Reject rejects a message. If requeue is true the message would be re-queued,
-// but for now it is deleted in both cases.
-func (q *Queue) Reject(sp storage.SegmentPosition, _ bool) error {
+// Reject rejects a message. If requeue is true the message is placed back at
+// the front of the queue for redelivery with the Redelivered flag set.
+// If requeue is false the message is deleted.
+func (q *Queue) Reject(sp storage.SegmentPosition, requeue bool) error {
+	if requeue {
+		q.mu.Lock()
+		q.requeued = append(q.requeued, sp)
+		q.mu.Unlock()
+		q.signalConsumers()
+		return nil
+	}
 	if err := q.store.Delete(sp); err != nil {
 		return fmt.Errorf("reject message at %s: %w", sp, err)
 	}
@@ -486,6 +526,29 @@ func (q *Queue) signalConsumers() {
 	case q.msgNotify <- struct{}{}:
 	default:
 	}
+}
+
+// shiftRequeued pops the last requeued position, reads the message from the
+// store, and returns it as a redelivered envelope. Must be called with q.mu held.
+func (q *Queue) shiftRequeued() (*storage.Envelope, bool) {
+	for len(q.requeued) > 0 {
+		// Pop from end (LIFO — most recently requeued served first).
+		sp := q.requeued[len(q.requeued)-1]
+		q.requeued = q.requeued[:len(q.requeued)-1]
+
+		msg, err := q.store.GetMessage(sp)
+		if err != nil {
+			// Message was already deleted or segment cleaned up; skip.
+			continue
+		}
+
+		return &storage.Envelope{
+			SegmentPosition: sp,
+			Message:         msg,
+			Redelivered:     true,
+		}, true
+	}
+	return nil, false
 }
 
 // dropHead shifts and deletes the oldest message from the store.
