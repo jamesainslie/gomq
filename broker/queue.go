@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jamesainslie/gomq/storage"
 )
@@ -52,11 +54,21 @@ type Queue struct {
 	fenceMu sync.Mutex
 	fences  []chan struct{} // per-Drain fence channels, signaled by writeLoop on nil sentinel
 
+	// Requeued messages waiting to be re-delivered (LIFO order, served first).
+	requeued []storage.SegmentPosition
+
+	// Dead letter exchange configuration parsed from arguments.
+	deadLetterExchange   string // x-dead-letter-exchange
+	deadLetterRoutingKey string // x-dead-letter-routing-key (optional override)
+	vhost                *VHost // back-reference for DLX republishing
+
 	// Limits parsed from arguments.
 	maxLength      int64  // 0 = unlimited (x-max-length)
 	maxLengthBytes int64  // 0 = unlimited (x-max-length-bytes)
 	messageTTL     int64  // 0 = no TTL (x-message-ttl), milliseconds
 	overflow       string // "drop-head" (default) or "reject-publish"
+	expiresMs      int64  // 0 = no queue expiry (x-expires), milliseconds
+	expireTimer    *time.Timer
 
 	// Stats.
 	publishCount atomic.Uint64
@@ -116,6 +128,8 @@ func NewQueue(name string, durable, exclusive, autoDelete bool, args map[string]
 
 	queue.inboxWg.Add(1)
 	go queue.writeLoop()
+
+	queue.startExpireTimer()
 
 	return queue, nil
 }
@@ -276,58 +290,117 @@ func (q *Queue) publishToStore(msg *storage.Message) {
 }
 
 // Get shifts one message from the front of the queue (basic.get semantics).
+// Requeued messages are served first with the Redelivered flag set.
+// Expired messages are dead-lettered or deleted and silently skipped.
 // If noAck is true the message is considered immediately consumed. Returns
 // false when the queue is empty.
 func (q *Queue) Get(noAck bool) (*storage.Envelope, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	env, ok := q.store.Shift()
-	if !ok {
-		return nil, false
-	}
-
-	q.deliverCount.Add(1)
-
-	if noAck {
-		// Auto-ack: delete from store immediately. A delete failure here is
-		// non-fatal for the caller (the message was already shifted), so we
-		// skip the error. The message will be cleaned up on segment GC.
-		if delErr := q.store.Delete(env.SegmentPosition); delErr == nil {
-			q.ackCount.Add(1)
+	for {
+		// Serve requeued messages first.
+		if env, ok := q.shiftRequeued(); ok {
+			if q.isExpired(env.Message) {
+				_ = q.deadLetterOrDelete(env.SegmentPosition, "expired") //nolint:errcheck // best-effort expiry cleanup
+				continue
+			}
+			q.deliverCount.Add(1)
+			if noAck {
+				if delErr := q.store.Delete(env.SegmentPosition); delErr == nil {
+					q.ackCount.Add(1)
+				}
+			}
+			return env, true
 		}
-	}
 
-	return env, true
+		env, ok := q.store.Shift()
+		if !ok {
+			return nil, false
+		}
+
+		if q.isExpired(env.Message) {
+			_ = q.deadLetterOrDelete(env.SegmentPosition, "expired") //nolint:errcheck // best-effort expiry cleanup
+			continue
+		}
+
+		q.deliverCount.Add(1)
+
+		if noAck {
+			if delErr := q.store.Delete(env.SegmentPosition); delErr == nil {
+				q.ackCount.Add(1)
+			}
+		}
+
+		return env, true
+	}
 }
 
 // GetFunc shifts one message from the front of the queue and calls fn with the
-// envelope. The envelope's Body may alias the mmap region and is only valid
-// during fn. If fn returns an error, the message is not consumed and remains
-// available. Returns false when the queue is empty.
+// envelope. Requeued messages are served first with the Redelivered flag set.
+// Expired messages are dead-lettered or deleted and silently skipped.
+// The envelope's Body may alias the mmap region and is only valid during fn.
+// If fn returns an error, the message is not consumed and remains available.
+// Returns false when the queue is empty.
 func (q *Queue) GetFunc(noAck bool, fn func(env *storage.Envelope) error) (bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	var sp storage.SegmentPosition
-	ok, err := q.store.ShiftFunc(func(env *storage.Envelope) error {
-		sp = env.SegmentPosition
-		return fn(env)
-	})
-	if !ok || err != nil {
-		return false, err
-	}
-
-	q.deliverCount.Add(1)
-
-	if noAck {
-		// Auto-ack after ShiftFunc returns (store lock released).
-		if delErr := q.store.Delete(sp); delErr == nil {
-			q.ackCount.Add(1)
+	for {
+		// Serve requeued messages first.
+		if env, ok := q.shiftRequeued(); ok {
+			if q.isExpired(env.Message) {
+				_ = q.deadLetterOrDelete(env.SegmentPosition, "expired") //nolint:errcheck // best-effort expiry cleanup
+				continue
+			}
+			if err := fn(env); err != nil {
+				// Put it back on requeue if delivery fails.
+				q.requeued = append(q.requeued, env.SegmentPosition)
+				return false, err
+			}
+			q.deliverCount.Add(1)
+			if noAck {
+				if delErr := q.store.Delete(env.SegmentPosition); delErr == nil {
+					q.ackCount.Add(1)
+				}
+			}
+			return true, nil
 		}
-	}
 
-	return true, nil
+		// Try the normal store path. ShiftFunc uses zero-copy reads under the
+		// store lock, so we cannot loop inside it -- we fall through to Shift
+		// if the message is expired.
+		var sp storage.SegmentPosition
+		var expired bool
+		ok, err := q.store.ShiftFunc(func(env *storage.Envelope) error {
+			sp = env.SegmentPosition
+			if q.isExpired(env.Message) {
+				expired = true
+				return nil // accept the shift, we'll dead-letter outside
+			}
+			return fn(env)
+		})
+		if !ok {
+			return false, err
+		}
+		if err != nil {
+			return false, err
+		}
+		if expired {
+			_ = q.deadLetterOrDelete(sp, "expired") //nolint:errcheck // best-effort expiry cleanup
+			continue
+		}
+
+		q.deliverCount.Add(1)
+
+		if noAck {
+			if delErr := q.store.Delete(sp); delErr == nil {
+				q.ackCount.Add(1)
+			}
+		}
+
+		return true, nil
+	}
 }
 
 // Ack acknowledges a message, deleting it from the store.
@@ -339,10 +412,19 @@ func (q *Queue) Ack(sp storage.SegmentPosition) error {
 	return nil
 }
 
-// Reject rejects a message. If requeue is true the message would be re-queued,
-// but for now it is deleted in both cases.
-func (q *Queue) Reject(sp storage.SegmentPosition, _ bool) error {
-	if err := q.store.Delete(sp); err != nil {
+// Reject rejects a message. If requeue is true the message is placed back at
+// the front of the queue for redelivery with the Redelivered flag set.
+// If requeue is false the message is dead-lettered (if a DLX is configured)
+// or deleted.
+func (q *Queue) Reject(sp storage.SegmentPosition, requeue bool) error {
+	if requeue {
+		q.mu.Lock()
+		q.requeued = append(q.requeued, sp)
+		q.mu.Unlock()
+		q.signalConsumers()
+		return nil
+	}
+	if err := q.deadLetterOrDelete(sp, "rejected"); err != nil {
 		return fmt.Errorf("reject message at %s: %w", sp, err)
 	}
 	return nil
@@ -380,6 +462,7 @@ func (q *Queue) AddConsumer(consumer *consumerStub) error {
 
 	q.consumers = append(q.consumers, consumer)
 	q.hadConsumers = true
+	q.stopExpireTimer()
 	return nil
 }
 
@@ -398,6 +481,10 @@ func (q *Queue) RemoveConsumer(tag string) {
 
 	if q.autoDelete && q.hadConsumers && len(q.consumers) == 0 {
 		q.markedForDelete.Store(true)
+	}
+
+	if len(q.consumers) == 0 {
+		q.resetExpireTimer()
 	}
 }
 
@@ -425,6 +512,7 @@ func (q *Queue) Close() error {
 	if q.closed.Swap(true) {
 		return nil
 	}
+	q.stopExpireTimer()
 	q.inboxMu.Lock()
 	close(q.inbox)
 	q.inboxMu.Unlock()
@@ -488,13 +576,141 @@ func (q *Queue) signalConsumers() {
 	}
 }
 
-// dropHead shifts and deletes the oldest message from the store.
+// startExpireTimer starts the queue expiry timer if x-expires is configured
+// and no consumers are connected. When the timer fires, the queue is marked
+// for deletion.
+func (q *Queue) startExpireTimer() {
+	if q.expiresMs <= 0 {
+		return
+	}
+	q.expireTimer = time.AfterFunc(time.Duration(q.expiresMs)*time.Millisecond, func() {
+		q.markedForDelete.Store(true)
+	})
+}
+
+// stopExpireTimer cancels the queue expiry timer (e.g., when a consumer connects).
+func (q *Queue) stopExpireTimer() {
+	if q.expireTimer != nil {
+		q.expireTimer.Stop()
+		q.expireTimer = nil
+	}
+}
+
+// resetExpireTimer restarts the queue expiry timer (e.g., when the last consumer
+// disconnects). Must be called with q.mu held.
+func (q *Queue) resetExpireTimer() {
+	q.stopExpireTimer()
+	q.startExpireTimer()
+}
+
+// isExpired reports whether a message has exceeded the queue's message TTL or
+// the per-message expiration. Must be called with q.mu held (or at a point
+// where the message is already shifted and owned by the caller).
+func (q *Queue) isExpired(msg *storage.BytesMessage) bool {
+	now := time.Now().UnixMilli()
+	age := now - msg.Timestamp
+
+	// Queue-level TTL.
+	if q.messageTTL > 0 && age > q.messageTTL {
+		return true
+	}
+
+	// Per-message expiration (AMQP spec: expiration is a string in milliseconds).
+	if msg.Properties.Expiration != "" {
+		if ttl, err := strconv.ParseInt(msg.Properties.Expiration, 10, 64); err == nil && ttl >= 0 {
+			if age > ttl {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// shiftRequeued pops the last requeued position, reads the message from the
+// store, and returns it as a redelivered envelope. Must be called with q.mu held.
+func (q *Queue) shiftRequeued() (*storage.Envelope, bool) {
+	for len(q.requeued) > 0 {
+		// Pop from end (LIFO — most recently requeued served first).
+		sp := q.requeued[len(q.requeued)-1]
+		q.requeued = q.requeued[:len(q.requeued)-1]
+
+		msg, err := q.store.GetMessage(sp)
+		if err != nil {
+			// Message was already deleted or segment cleaned up; skip.
+			continue
+		}
+
+		return &storage.Envelope{
+			SegmentPosition: sp,
+			Message:         msg,
+			Redelivered:     true,
+		}, true
+	}
+	return nil, false
+}
+
+// dropHead shifts the oldest message from the store and either dead-letters
+// or deletes it depending on queue configuration.
 func (q *Queue) dropHead() error {
 	env, ok := q.store.Shift()
 	if !ok {
 		return nil
 	}
-	return q.store.Delete(env.SegmentPosition)
+	return q.deadLetterOrDelete(env.SegmentPosition, "maxlen")
+}
+
+// deadLetterOrDelete republishes the message to the dead-letter exchange if
+// one is configured, then deletes it from the store. If no DLX is set, the
+// message is simply deleted. The reason is recorded in the x-death header.
+func (q *Queue) deadLetterOrDelete(sp storage.SegmentPosition, reason string) error {
+	if q.deadLetterExchange == "" || q.vhost == nil {
+		return q.store.Delete(sp)
+	}
+
+	msg, err := q.store.GetMessage(sp)
+	if err != nil {
+		// Cannot read the message; just delete.
+		return q.store.Delete(sp)
+	}
+
+	routingKey := q.deadLetterRoutingKey
+	if routingKey == "" {
+		routingKey = msg.RoutingKey
+	}
+
+	// Build x-death entry per AMQP dead-lettering spec.
+	xDeath := map[string]interface{}{
+		"queue":        q.name,
+		"reason":       reason,
+		"exchange":     msg.ExchangeName,
+		"routing-keys": []interface{}{msg.RoutingKey},
+		"count":        int64(1),
+		"time":         time.Now().Unix(),
+	}
+
+	headers := make(map[string]interface{})
+	for k, v := range msg.Properties.Headers {
+		headers[k] = v
+	}
+	headers["x-death"] = []interface{}{xDeath}
+
+	dlMsg := &storage.Message{
+		Timestamp:    time.Now().UnixMilli(),
+		ExchangeName: q.deadLetterExchange,
+		RoutingKey:   routingKey,
+		Properties: storage.Properties{
+			Headers:    headers,
+			Expiration: msg.Properties.Expiration,
+		},
+		BodySize: msg.BodySize,
+		Body:     msg.Body,
+	}
+
+	// Publish to the DLX; ignore routing errors (exchange may not exist).
+	_ = q.vhost.Publish(q.deadLetterExchange, routingKey, false, dlMsg) //nolint:errcheck // best-effort DLX delivery
+
+	return q.store.Delete(sp)
 }
 
 // parseArguments extracts queue limits from the argument map.
@@ -520,12 +736,33 @@ func (q *Queue) parseArguments(args map[string]interface{}) {
 			q.overflow = s
 		}
 	}
+
+	q.deadLetterExchange = stringArg(args, "x-dead-letter-exchange")
+	q.deadLetterRoutingKey = stringArg(args, "x-dead-letter-routing-key")
+
+	if v, ok := args["x-expires"]; ok {
+		q.expiresMs = toInt64(v)
+	}
 }
 
 // toInt64 coerces an interface{} value to int64, handling the various
 // integer types that arrive from AMQP table decoding. Different client
 // libraries use different wire type tags for the same logical value
 // (e.g. amqp091-go uses 'l' for int64 which GoMQ decodes as uint64).
+// stringArg extracts a string value from an argument map, returning ""
+// if the key is absent or not a string.
+func stringArg(args map[string]interface{}, key string) string {
+	v, ok := args[key]
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
 func toInt64(v interface{}) int64 {
 	switch val := v.(type) {
 	case int64:

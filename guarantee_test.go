@@ -457,12 +457,9 @@ func TestGuarantee_NackRequeue(t *testing.T) {
 		}
 	}
 
-	// Consume again -- should get the requeued messages.
-	// NOTE: nack-requeue is not yet implemented in the broker (Queue.Reject
-	// always deletes regardless of the requeue flag). This test documents the
-	// expected behaviour and will start passing once the feature lands.
+	// Consume again -- should get the requeued messages with Redelivered=true.
 	redelivered := 0
-	timeout := time.After(2 * time.Second)
+	timeout := time.After(5 * time.Second)
 	for redelivered < msgCount {
 		select {
 		case msg := <-msgs:
@@ -474,9 +471,6 @@ func TestGuarantee_NackRequeue(t *testing.T) {
 				t.Fatalf("ack redelivered msg: %v", err)
 			}
 		case <-timeout:
-			if redelivered == 0 {
-				t.Skip("nack-requeue not yet implemented (Queue.Reject ignores requeue flag)")
-			}
 			t.Fatalf("timed out waiting for redelivered messages: got %d/%d", redelivered, msgCount)
 		}
 	}
@@ -676,5 +670,359 @@ func TestGuarantee_MaxLengthRejectPublish(t *testing.T) {
 		if received[i] != want {
 			t.Errorf("message %d: got %q, want %q", i, received[i], want)
 		}
+	}
+}
+
+func TestGuarantee_DeadLetterOnReject(t *testing.T) {
+	t.Parallel()
+
+	brk := startTestBroker(t)
+	conn := dialBroker(t, brk)
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+
+	// Enable confirms for synchronous persistence.
+	if err := ch.Confirm(false); err != nil {
+		t.Fatalf("enable confirms: %v", err)
+	}
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 10))
+
+	// Declare DLX exchange and dead-letter queue.
+	if err := ch.ExchangeDeclare("dlx", "direct", false, false, false, false, nil); err != nil {
+		t.Fatalf("declare dlx exchange: %v", err)
+	}
+
+	dlq, err := ch.QueueDeclare("dead-letters", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("declare dead-letter queue: %v", err)
+	}
+
+	if err := ch.QueueBind(dlq.Name, "reject-test", "dlx", false, nil); err != nil {
+		t.Fatalf("bind dlq: %v", err)
+	}
+
+	// Declare source queue with DLX configured.
+	args := amqp.Table{
+		"x-dead-letter-exchange":    "dlx",
+		"x-dead-letter-routing-key": "reject-test",
+	}
+	srcQ, err := ch.QueueDeclare("dlx-reject-src", false, false, false, false, args)
+	if err != nil {
+		t.Fatalf("declare source queue: %v", err)
+	}
+
+	// Publish a message.
+	ctx, cancel := context.WithTimeout(context.Background(), guaranteeTimeout)
+	defer cancel()
+
+	if err := ch.PublishWithContext(ctx, "", srcQ.Name, false, false, amqp.Publishing{
+		Body: []byte("dead-letter-me"),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case c := <-confirms:
+		if !c.Ack {
+			t.Fatal("publish nacked")
+		}
+	case <-ctx.Done():
+		t.Fatal("confirm timeout")
+	}
+
+	// Consume and reject without requeue.
+	msg, ok, err := ch.Get(srcQ.Name, false)
+	if err != nil {
+		t.Fatalf("get from source: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected message in source queue")
+	}
+	if err := msg.Reject(false); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+
+	// Give the dead-letter publish time to propagate.
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the message landed in the DLQ.
+	dlMsg, ok, err := ch.Get(dlq.Name, true)
+	if err != nil {
+		t.Fatalf("get from dlq: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected message in dead-letter queue")
+	}
+	if string(dlMsg.Body) != "dead-letter-me" {
+		t.Errorf("dlq body = %q, want %q", string(dlMsg.Body), "dead-letter-me")
+	}
+
+	// Verify x-death header is present.
+	xDeath, ok := dlMsg.Headers["x-death"]
+	if !ok {
+		t.Fatal("x-death header missing from dead-lettered message")
+	}
+
+	deathList, ok := xDeath.([]interface{})
+	if !ok || len(deathList) == 0 {
+		t.Fatalf("x-death is not a non-empty list: %T", xDeath)
+	}
+}
+
+func TestGuarantee_DeadLetterOnOverflow(t *testing.T) {
+	t.Parallel()
+
+	brk := startTestBroker(t)
+	conn := dialBroker(t, brk)
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+
+	// Enable confirms for synchronous persistence.
+	if err := ch.Confirm(false); err != nil {
+		t.Fatalf("enable confirms: %v", err)
+	}
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 10))
+
+	// Declare DLX exchange and dead-letter queue.
+	if err := ch.ExchangeDeclare("dlx-overflow", "fanout", false, false, false, false, nil); err != nil {
+		t.Fatalf("declare dlx exchange: %v", err)
+	}
+
+	dlq, err := ch.QueueDeclare("overflow-dead-letters", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("declare dead-letter queue: %v", err)
+	}
+
+	if err := ch.QueueBind(dlq.Name, "", "dlx-overflow", false, nil); err != nil {
+		t.Fatalf("bind dlq: %v", err)
+	}
+
+	// Declare source queue with max-length=1 and DLX.
+	args := amqp.Table{
+		"x-max-length":           int64(1),
+		"x-dead-letter-exchange": "dlx-overflow",
+	}
+	srcQ, err := ch.QueueDeclare("dlx-overflow-src", true, false, false, false, args)
+	if err != nil {
+		t.Fatalf("declare source queue: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), guaranteeTimeout)
+	defer cancel()
+
+	// Publish 2 messages; first should be dropped (drop-head) to DLX.
+	for seq := 1; seq <= 2; seq++ {
+		body := fmt.Sprintf("overflow-%d", seq)
+		if err := ch.PublishWithContext(ctx, "", srcQ.Name, false, false, amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			Body:         []byte(body),
+		}); err != nil {
+			t.Fatalf("publish msg %d: %v", seq, err)
+		}
+		select {
+		case c := <-confirms:
+			if !c.Ack {
+				t.Fatalf("msg %d nacked", seq)
+			}
+		case <-ctx.Done():
+			t.Fatalf("confirm timeout for msg %d", seq)
+		}
+	}
+
+	// Give the dead-letter publish time to propagate.
+	time.Sleep(100 * time.Millisecond)
+
+	// Source queue should have only the second message.
+	srcMsg, ok, err := ch.Get(srcQ.Name, true)
+	if err != nil {
+		t.Fatalf("get from source: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected message in source queue")
+	}
+	if string(srcMsg.Body) != "overflow-2" {
+		t.Errorf("source body = %q, want %q", string(srcMsg.Body), "overflow-2")
+	}
+
+	// DLQ should have the dropped first message.
+	dlMsg, ok, err := ch.Get(dlq.Name, true)
+	if err != nil {
+		t.Fatalf("get from dlq: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected message in dead-letter queue")
+	}
+	if string(dlMsg.Body) != "overflow-1" {
+		t.Errorf("dlq body = %q, want %q", string(dlMsg.Body), "overflow-1")
+	}
+}
+
+func TestGuarantee_MessageTTL(t *testing.T) {
+	t.Parallel()
+
+	brk := startTestBroker(t)
+	conn := dialBroker(t, brk)
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+
+	// Queue with 50ms TTL.
+	args := amqp.Table{
+		"x-message-ttl": int64(50),
+	}
+	queue, err := ch.QueueDeclare("ttl-test", false, false, false, false, args)
+	if err != nil {
+		t.Fatalf("declare queue: %v", err)
+	}
+
+	// Publish a message.
+	if err := ch.PublishWithContext(context.Background(), "", queue.Name, false, false, amqp.Publishing{
+		Body: []byte("will-expire"),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Wait for the message to expire.
+	time.Sleep(100 * time.Millisecond)
+
+	// basic.get should return nothing (message expired).
+	_, ok, err := ch.Get(queue.Name, true)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if ok {
+		t.Error("expected no message (should have expired), but got one")
+	}
+}
+
+func TestGuarantee_DeadLetterOnTTL(t *testing.T) {
+	t.Parallel()
+
+	brk := startTestBroker(t)
+	conn := dialBroker(t, brk)
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+
+	// Declare DLX exchange and dead-letter queue.
+	if err := ch.ExchangeDeclare("dlx-ttl", "fanout", false, false, false, false, nil); err != nil {
+		t.Fatalf("declare dlx exchange: %v", err)
+	}
+
+	dlq, err := ch.QueueDeclare("ttl-dead-letters", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("declare dead-letter queue: %v", err)
+	}
+
+	if err := ch.QueueBind(dlq.Name, "", "dlx-ttl", false, nil); err != nil {
+		t.Fatalf("bind dlq: %v", err)
+	}
+
+	// Queue with 50ms TTL and DLX.
+	args := amqp.Table{
+		"x-message-ttl":          int64(50),
+		"x-dead-letter-exchange": "dlx-ttl",
+	}
+	srcQ, err := ch.QueueDeclare("ttl-dlx-src", false, false, false, false, args)
+	if err != nil {
+		t.Fatalf("declare source queue: %v", err)
+	}
+
+	// Publish a message.
+	if err := ch.PublishWithContext(context.Background(), "", srcQ.Name, false, false, amqp.Publishing{
+		Body: []byte("ttl-dead-letter"),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Wait for expiry, then trigger lazy expiry via basic.get.
+	time.Sleep(100 * time.Millisecond)
+
+	_, ok, err := ch.Get(srcQ.Name, true)
+	if err != nil {
+		t.Fatalf("get from source: %v", err)
+	}
+	if ok {
+		t.Error("expected source queue empty after TTL expiry")
+	}
+
+	// Give the DLX publish time to propagate.
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the message landed in the DLQ.
+	dlMsg, ok, err := ch.Get(dlq.Name, true)
+	if err != nil {
+		t.Fatalf("get from dlq: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected message in dead-letter queue after TTL expiry")
+	}
+	if string(dlMsg.Body) != "ttl-dead-letter" {
+		t.Errorf("dlq body = %q, want %q", string(dlMsg.Body), "ttl-dead-letter")
+	}
+}
+
+func TestGuarantee_PerMessageTTL(t *testing.T) {
+	t.Parallel()
+
+	brk := startTestBroker(t)
+	conn := dialBroker(t, brk)
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+
+	queue, err := ch.QueueDeclare("per-msg-ttl-test", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("declare queue: %v", err)
+	}
+
+	// Publish a message with per-message expiration of 100ms.
+	if err := ch.PublishWithContext(context.Background(), "", queue.Name, false, false, amqp.Publishing{
+		Expiration: "100",
+		Body:       []byte("per-msg-expire"),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Also publish a message without expiration.
+	if err := ch.PublishWithContext(context.Background(), "", queue.Name, false, false, amqp.Publishing{
+		Body: []byte("no-expire"),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Wait for per-message TTL to expire.
+	time.Sleep(200 * time.Millisecond)
+
+	// The first message should be expired; the second should survive.
+	msg, ok, err := ch.Get(queue.Name, true)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected at least one message")
+	}
+	if string(msg.Body) != "no-expire" {
+		t.Errorf("expected non-expiring message, got %q", string(msg.Body))
+	}
+
+	// No more messages.
+	_, ok, err = ch.Get(queue.Name, true)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if ok {
+		t.Error("expected no more messages")
 	}
 }

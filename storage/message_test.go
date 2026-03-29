@@ -66,7 +66,7 @@ func TestMessage_ByteSize(t *testing.T) {
 				BodySize:     0,
 				Body:         nil,
 			},
-			want: 8 + 1 + 0 + 1 + 0 + 2 + 8 + 0, // ts + exlen + ex + rklen + rk + flags + bodysize + body
+			want: 8 + 1 + 0 + 1 + 0 + 2 + 8 + 0 + 4 + 0 + 1 + 0, // ts + exlen + ex + rklen + rk + flags + bodysize + body + hdrssize + hdrs + explen + exp
 		},
 		{
 			name: "with data",
@@ -78,7 +78,7 @@ func TestMessage_ByteSize(t *testing.T) {
 				BodySize:     5,
 				Body:         []byte("hello"),
 			},
-			want: 8 + 1 + 10 + 1 + 6 + 2 + 8 + 5,
+			want: 8 + 1 + 10 + 1 + 6 + 2 + 8 + 5 + 4 + 0 + 1 + 0,
 		},
 	}
 
