@@ -12,5 +12,7 @@ func freeDiskBytes(path string) (int64, error) {
 		return 0, err
 	}
 	//nolint:gosec // block size and available blocks are bounded by OS
-	return int64(stat.Bavail) * int64(stat.Bsize), nil
+	avail := int64(stat.Bavail) //nolint:unconvert // type varies by platform
+	bsize := int64(stat.Bsize) //nolint:unconvert // type varies by platform
+	return avail * bsize, nil
 }
