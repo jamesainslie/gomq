@@ -672,3 +672,192 @@ func TestGuarantee_MaxLengthRejectPublish(t *testing.T) {
 		}
 	}
 }
+
+func TestGuarantee_DeadLetterOnReject(t *testing.T) {
+	t.Parallel()
+
+	brk := startTestBroker(t)
+	conn := dialBroker(t, brk)
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+
+	// Enable confirms for synchronous persistence.
+	if err := ch.Confirm(false); err != nil {
+		t.Fatalf("enable confirms: %v", err)
+	}
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 10))
+
+	// Declare DLX exchange and dead-letter queue.
+	if err := ch.ExchangeDeclare("dlx", "direct", false, false, false, false, nil); err != nil {
+		t.Fatalf("declare dlx exchange: %v", err)
+	}
+
+	dlq, err := ch.QueueDeclare("dead-letters", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("declare dead-letter queue: %v", err)
+	}
+
+	if err := ch.QueueBind(dlq.Name, "reject-test", "dlx", false, nil); err != nil {
+		t.Fatalf("bind dlq: %v", err)
+	}
+
+	// Declare source queue with DLX configured.
+	args := amqp.Table{
+		"x-dead-letter-exchange":    "dlx",
+		"x-dead-letter-routing-key": "reject-test",
+	}
+	srcQ, err := ch.QueueDeclare("dlx-reject-src", false, false, false, false, args)
+	if err != nil {
+		t.Fatalf("declare source queue: %v", err)
+	}
+
+	// Publish a message.
+	ctx, cancel := context.WithTimeout(context.Background(), guaranteeTimeout)
+	defer cancel()
+
+	if err := ch.PublishWithContext(ctx, "", srcQ.Name, false, false, amqp.Publishing{
+		Body: []byte("dead-letter-me"),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case c := <-confirms:
+		if !c.Ack {
+			t.Fatal("publish nacked")
+		}
+	case <-ctx.Done():
+		t.Fatal("confirm timeout")
+	}
+
+	// Consume and reject without requeue.
+	msg, ok, err := ch.Get(srcQ.Name, false)
+	if err != nil {
+		t.Fatalf("get from source: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected message in source queue")
+	}
+	if err := msg.Reject(false); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+
+	// Give the dead-letter publish time to propagate.
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the message landed in the DLQ.
+	dlMsg, ok, err := ch.Get(dlq.Name, true)
+	if err != nil {
+		t.Fatalf("get from dlq: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected message in dead-letter queue")
+	}
+	if string(dlMsg.Body) != "dead-letter-me" {
+		t.Errorf("dlq body = %q, want %q", string(dlMsg.Body), "dead-letter-me")
+	}
+
+	// Verify x-death header is present.
+	xDeath, ok := dlMsg.Headers["x-death"]
+	if !ok {
+		t.Fatal("x-death header missing from dead-lettered message")
+	}
+
+	deathList, ok := xDeath.([]interface{})
+	if !ok || len(deathList) == 0 {
+		t.Fatalf("x-death is not a non-empty list: %T", xDeath)
+	}
+}
+
+func TestGuarantee_DeadLetterOnOverflow(t *testing.T) {
+	t.Parallel()
+
+	brk := startTestBroker(t)
+	conn := dialBroker(t, brk)
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+
+	// Enable confirms for synchronous persistence.
+	if err := ch.Confirm(false); err != nil {
+		t.Fatalf("enable confirms: %v", err)
+	}
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 10))
+
+	// Declare DLX exchange and dead-letter queue.
+	if err := ch.ExchangeDeclare("dlx-overflow", "fanout", false, false, false, false, nil); err != nil {
+		t.Fatalf("declare dlx exchange: %v", err)
+	}
+
+	dlq, err := ch.QueueDeclare("overflow-dead-letters", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("declare dead-letter queue: %v", err)
+	}
+
+	if err := ch.QueueBind(dlq.Name, "", "dlx-overflow", false, nil); err != nil {
+		t.Fatalf("bind dlq: %v", err)
+	}
+
+	// Declare source queue with max-length=1 and DLX.
+	args := amqp.Table{
+		"x-max-length":           int64(1),
+		"x-dead-letter-exchange": "dlx-overflow",
+	}
+	srcQ, err := ch.QueueDeclare("dlx-overflow-src", true, false, false, false, args)
+	if err != nil {
+		t.Fatalf("declare source queue: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), guaranteeTimeout)
+	defer cancel()
+
+	// Publish 2 messages; first should be dropped (drop-head) to DLX.
+	for seq := 1; seq <= 2; seq++ {
+		body := fmt.Sprintf("overflow-%d", seq)
+		if err := ch.PublishWithContext(ctx, "", srcQ.Name, false, false, amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			Body:         []byte(body),
+		}); err != nil {
+			t.Fatalf("publish msg %d: %v", seq, err)
+		}
+		select {
+		case c := <-confirms:
+			if !c.Ack {
+				t.Fatalf("msg %d nacked", seq)
+			}
+		case <-ctx.Done():
+			t.Fatalf("confirm timeout for msg %d", seq)
+		}
+	}
+
+	// Give the dead-letter publish time to propagate.
+	time.Sleep(100 * time.Millisecond)
+
+	// Source queue should have only the second message.
+	srcMsg, ok, err := ch.Get(srcQ.Name, true)
+	if err != nil {
+		t.Fatalf("get from source: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected message in source queue")
+	}
+	if string(srcMsg.Body) != "overflow-2" {
+		t.Errorf("source body = %q, want %q", string(srcMsg.Body), "overflow-2")
+	}
+
+	// DLQ should have the dropped first message.
+	dlMsg, ok, err := ch.Get(dlq.Name, true)
+	if err != nil {
+		t.Fatalf("get from dlq: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected message in dead-letter queue")
+	}
+	if string(dlMsg.Body) != "overflow-1" {
+		t.Errorf("dlq body = %q, want %q", string(dlMsg.Body), "overflow-1")
+	}
+}

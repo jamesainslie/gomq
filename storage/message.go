@@ -2,12 +2,20 @@ package storage
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 )
 
 // MinMessageSize is the byte size of a message with empty exchange, empty routing key,
-// and zero-length body: timestamp(8) + exLen(1) + rkLen(1) + flags(2) + bodySize(8) = 20.
-const MinMessageSize = 20
+// zero-length body, no headers, and no expiration:
+// timestamp(8) + exLen(1) + rkLen(1) + flags(2) + bodySize(8) + headersSize(4) + expirationLen(1) = 25.
+const MinMessageSize = 25
+
+// headersSizeLen is the byte length of the headers size prefix (uint32).
+const headersSizeLen = 4
+
+// expirationLenSize is the byte length of the expiration length prefix.
+const expirationLenSize = 1
 
 // Message represents a message from a publisher, ready to be serialized to a segment.
 type Message struct {
@@ -21,8 +29,9 @@ type Message struct {
 
 // Properties holds AMQP-style property flags and optional headers.
 type Properties struct {
-	Flags   uint16
-	Headers map[string]any
+	Flags      uint16
+	Headers    map[string]any
+	Expiration string // per-message TTL in milliseconds (AMQP expiration property)
 }
 
 // BytesMessage is a deserialized message read back from a segment.
@@ -46,15 +55,33 @@ type Envelope struct {
 // ByteSize returns the total serialized size of the message in bytes.
 func (msg *Message) ByteSize() int {
 	// timestamp(8) + exLen(1) + exchange(N) + rkLen(1) + routingKey(N) + flags(2) + bodySize(8) + body(N)
-	return 8 + 1 + len(msg.ExchangeName) + 1 + len(msg.RoutingKey) + 2 + 8 + int(msg.BodySize) //nolint:gosec // body size bounded by max message size (128MB)
+	// + headersSize(4) + headersJSON(N) + expirationLen(1) + expiration(N)
+	base := 8 + 1 + len(msg.ExchangeName) + 1 + len(msg.RoutingKey) + 2 + 8 + int(msg.BodySize) //nolint:gosec,mnd // body size bounded by max message size (128MB)
+	ext := headersSizeLen + len(msg.encodedHeaders()) + expirationLenSize + len(msg.Properties.Expiration)
+	return base + ext
 }
 
-// MarshalTo serializes the message into buf using the LavinMQ binary format.
+// encodedHeaders returns the JSON-encoded headers blob, or nil if there are
+// no headers.
+func (msg *Message) encodedHeaders() []byte {
+	if len(msg.Properties.Headers) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(msg.Properties.Headers)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// MarshalTo serializes the message into buf using the GoMQ binary format.
 // buf must be at least ByteSize() bytes. Returns the number of bytes written.
 //
 // Binary format (little-endian unless noted):
 //
-//	timestamp(8) | ex_name_len(1) | ex_name(N) | rk_len(1) | rk(N) | properties_flags(2 BE) | body_size(8) | body(N)
+//	timestamp(8) | ex_name_len(1) | ex_name(N) | rk_len(1) | rk(N)
+//	| properties_flags(2 BE) | body_size(8) | body(N)
+//	| headers_size(4) | headers_json(N) | expiration_len(1) | expiration(N)
 func (msg *Message) MarshalTo(buf []byte) int {
 	pos := 0
 
@@ -77,6 +104,16 @@ func (msg *Message) MarshalTo(buf []byte) int {
 	pos += 8
 
 	pos += copy(buf[pos:], msg.Body)
+
+	// Extended properties: headers (JSON) + expiration.
+	hdrs := msg.encodedHeaders()
+	binary.LittleEndian.PutUint32(buf[pos:], uint32(len(hdrs))) //nolint:gosec // header blob bounded by max message size
+	pos += 4
+	pos += copy(buf[pos:], hdrs)
+
+	buf[pos] = byte(len(msg.Properties.Expiration)) //nolint:gosec // AMQP shortstr max 255
+	pos++
+	pos += copy(buf[pos:], msg.Properties.Expiration)
 
 	return pos
 }
@@ -128,12 +165,15 @@ func ReadBytesMessage(buf []byte) (*BytesMessage, error) {
 	// Copy body so the result does not alias the mmap region.
 	body := make([]byte, bodySize)
 	copy(body, buf[pos:pos+int(bodySize)]) //nolint:gosec // body size bounded by max message size (128MB)
+	pos += int(bodySize)                   //nolint:gosec // body size bounded by max message size (128MB)
+
+	headers, expiration := readExtendedProps(buf[pos:])
 
 	return &BytesMessage{
 		Timestamp:    timestamp,
 		ExchangeName: exchangeName,
 		RoutingKey:   routingKey,
-		Properties:   Properties{Flags: flags},
+		Properties:   Properties{Flags: flags, Headers: headers, Expiration: expiration},
 		BodySize:     bodySize,
 		Body:         body,
 	}, nil
@@ -187,12 +227,15 @@ func ReadBytesMessageZeroCopy(buf []byte) (*BytesMessage, error) {
 
 	// Zero-copy: body aliases the input buffer directly.
 	body := buf[pos : pos+int(bodySize)] //nolint:gosec // body size bounded by max message size (128MB)
+	pos += int(bodySize)                 //nolint:gosec // body size bounded by max message size (128MB)
+
+	headers, expiration := readExtendedProps(buf[pos:])
 
 	return &BytesMessage{
 		Timestamp:    timestamp,
 		ExchangeName: exchangeName,
 		RoutingKey:   routingKey,
-		Properties:   Properties{Flags: flags},
+		Properties:   Properties{Flags: flags, Headers: headers, Expiration: expiration},
 		BodySize:     bodySize,
 		Body:         body,
 	}, nil
@@ -230,5 +273,58 @@ func SkipMessage(buf []byte) (int, error) {
 	bodySize := binary.LittleEndian.Uint64(buf[pos:])
 	pos += bodySizeLen + int(bodySize) //nolint:gosec // body size bounded by max message size (128MB)
 
+	// Extended properties: headers blob + expiration string.
+	pos += skipExtendedProps(buf[pos:])
+
 	return pos, nil
+}
+
+// readExtendedProps decodes the optional extended properties section that
+// follows the body: headers_size(4) | headers_json(N) | expiration_len(1) | expiration(N).
+// Returns nil headers and empty expiration if the buffer has no remaining data
+// (backward compatibility with old format messages).
+func readExtendedProps(buf []byte) (map[string]any, string) {
+	if len(buf) < headersSizeLen {
+		return nil, ""
+	}
+
+	hdrsLen := int(binary.LittleEndian.Uint32(buf[:headersSizeLen]))
+	pos := headersSizeLen
+
+	var headers map[string]any
+	if hdrsLen > 0 && pos+hdrsLen <= len(buf) {
+		if err := json.Unmarshal(buf[pos:pos+hdrsLen], &headers); err != nil {
+			headers = nil // silently drop malformed headers
+		}
+		pos += hdrsLen
+	}
+
+	var expiration string
+	if pos < len(buf) {
+		expLen := int(buf[pos])
+		pos++
+		if pos+expLen <= len(buf) {
+			expiration = string(buf[pos : pos+expLen])
+		}
+	}
+
+	return headers, expiration
+}
+
+// skipExtendedProps returns the total byte size of the extended properties
+// section without decoding it. Returns 0 if the buffer has no remaining data.
+func skipExtendedProps(buf []byte) int {
+	if len(buf) < headersSizeLen {
+		return 0
+	}
+
+	hdrsLen := int(binary.LittleEndian.Uint32(buf[:headersSizeLen]))
+	pos := headersSizeLen + hdrsLen
+
+	if pos < len(buf) {
+		expLen := int(buf[pos])
+		pos += 1 + expLen
+	}
+
+	return pos
 }

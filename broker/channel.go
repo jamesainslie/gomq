@@ -602,28 +602,50 @@ func tableToMap(t amqp.Table) map[string]interface{} {
 // storagePropsToAMQP converts storage properties to AMQP properties for delivery.
 func storagePropsToAMQP(sp storage.Properties) amqp.Properties {
 	return amqp.Properties{
-		Headers: headerMapToTable(sp.Headers),
+		Headers:    headerMapToTable(sp.Headers),
+		Expiration: sp.Expiration,
 	}
 }
 
 // amqpPropsToStorage converts AMQP properties to storage properties for persistence.
 func amqpPropsToStorage(ap amqp.Properties) storage.Properties {
 	return storage.Properties{
-		Flags:   ap.Flags(),
-		Headers: tableToHeaderMap(ap.Headers),
+		Flags:      ap.Flags(),
+		Headers:    tableToHeaderMap(ap.Headers),
+		Expiration: ap.Expiration,
 	}
 }
 
-// headerMapToTable converts a map[string]any to an amqp.Table.
+// headerMapToTable converts a map[string]any to an amqp.Table, recursively
+// converting nested maps and slices so that the AMQP table encoder can
+// serialize them correctly.
 func headerMapToTable(m map[string]any) amqp.Table {
 	if m == nil {
 		return nil
 	}
 	t := make(amqp.Table, len(m))
 	for k, v := range m {
-		t[k] = v
+		t[k] = convertHeaderValue(v)
 	}
 	return t
+}
+
+// convertHeaderValue converts nested map[string]any to amqp.Table and
+// []any elements recursively so they match the types expected by the
+// AMQP field table marshaler.
+func convertHeaderValue(value any) any {
+	switch val := value.(type) {
+	case map[string]any:
+		return headerMapToTable(val)
+	case []any:
+		out := make([]any, len(val))
+		for i, elem := range val {
+			out[i] = convertHeaderValue(elem)
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 // tableToHeaderMap converts an amqp.Table to a map[string]any.

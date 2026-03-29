@@ -177,6 +177,7 @@ func (v *VHost) DeclareQueue(name string, durable, exclusive, autoDelete bool, a
 		return nil, fmt.Errorf("declare queue %q: %w", name, err)
 	}
 
+	queue.vhost = v
 	v.queues[name] = queue
 
 	return queue, nil

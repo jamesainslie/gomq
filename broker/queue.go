@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jamesainslie/gomq/storage"
 )
@@ -54,6 +55,11 @@ type Queue struct {
 
 	// Requeued messages waiting to be re-delivered (LIFO order, served first).
 	requeued []storage.SegmentPosition
+
+	// Dead letter exchange configuration parsed from arguments.
+	deadLetterExchange   string // x-dead-letter-exchange
+	deadLetterRoutingKey string // x-dead-letter-routing-key (optional override)
+	vhost                *VHost // back-reference for DLX republishing
 
 	// Limits parsed from arguments.
 	maxLength      int64  // 0 = unlimited (x-max-length)
@@ -373,7 +379,8 @@ func (q *Queue) Ack(sp storage.SegmentPosition) error {
 
 // Reject rejects a message. If requeue is true the message is placed back at
 // the front of the queue for redelivery with the Redelivered flag set.
-// If requeue is false the message is deleted.
+// If requeue is false the message is dead-lettered (if a DLX is configured)
+// or deleted.
 func (q *Queue) Reject(sp storage.SegmentPosition, requeue bool) error {
 	if requeue {
 		q.mu.Lock()
@@ -382,7 +389,7 @@ func (q *Queue) Reject(sp storage.SegmentPosition, requeue bool) error {
 		q.signalConsumers()
 		return nil
 	}
-	if err := q.store.Delete(sp); err != nil {
+	if err := q.deadLetterOrDelete(sp, "rejected"); err != nil {
 		return fmt.Errorf("reject message at %s: %w", sp, err)
 	}
 	return nil
@@ -551,13 +558,67 @@ func (q *Queue) shiftRequeued() (*storage.Envelope, bool) {
 	return nil, false
 }
 
-// dropHead shifts and deletes the oldest message from the store.
+// dropHead shifts the oldest message from the store and either dead-letters
+// or deletes it depending on queue configuration.
 func (q *Queue) dropHead() error {
 	env, ok := q.store.Shift()
 	if !ok {
 		return nil
 	}
-	return q.store.Delete(env.SegmentPosition)
+	return q.deadLetterOrDelete(env.SegmentPosition, "maxlen")
+}
+
+// deadLetterOrDelete republishes the message to the dead-letter exchange if
+// one is configured, then deletes it from the store. If no DLX is set, the
+// message is simply deleted. The reason is recorded in the x-death header.
+func (q *Queue) deadLetterOrDelete(sp storage.SegmentPosition, reason string) error {
+	if q.deadLetterExchange == "" || q.vhost == nil {
+		return q.store.Delete(sp)
+	}
+
+	msg, err := q.store.GetMessage(sp)
+	if err != nil {
+		// Cannot read the message; just delete.
+		return q.store.Delete(sp)
+	}
+
+	routingKey := q.deadLetterRoutingKey
+	if routingKey == "" {
+		routingKey = msg.RoutingKey
+	}
+
+	// Build x-death entry per AMQP dead-lettering spec.
+	xDeath := map[string]interface{}{
+		"queue":        q.name,
+		"reason":       reason,
+		"exchange":     msg.ExchangeName,
+		"routing-keys": []interface{}{msg.RoutingKey},
+		"count":        int64(1),
+		"time":         time.Now().Unix(),
+	}
+
+	headers := make(map[string]interface{})
+	for k, v := range msg.Properties.Headers {
+		headers[k] = v
+	}
+	headers["x-death"] = []interface{}{xDeath}
+
+	dlMsg := &storage.Message{
+		Timestamp:    time.Now().UnixMilli(),
+		ExchangeName: q.deadLetterExchange,
+		RoutingKey:   routingKey,
+		Properties: storage.Properties{
+			Headers:    headers,
+			Expiration: msg.Properties.Expiration,
+		},
+		BodySize: msg.BodySize,
+		Body:     msg.Body,
+	}
+
+	// Publish to the DLX; ignore routing errors (exchange may not exist).
+	_ = q.vhost.Publish(q.deadLetterExchange, routingKey, false, dlMsg) //nolint:errcheck // best-effort DLX delivery
+
+	return q.store.Delete(sp)
 }
 
 // parseArguments extracts queue limits from the argument map.
@@ -583,12 +644,29 @@ func (q *Queue) parseArguments(args map[string]interface{}) {
 			q.overflow = s
 		}
 	}
+
+	q.deadLetterExchange = stringArg(args, "x-dead-letter-exchange")
+	q.deadLetterRoutingKey = stringArg(args, "x-dead-letter-routing-key")
 }
 
 // toInt64 coerces an interface{} value to int64, handling the various
 // integer types that arrive from AMQP table decoding. Different client
 // libraries use different wire type tags for the same logical value
 // (e.g. amqp091-go uses 'l' for int64 which GoMQ decodes as uint64).
+// stringArg extracts a string value from an argument map, returning ""
+// if the key is absent or not a string.
+func stringArg(args map[string]interface{}, key string) string {
+	v, ok := args[key]
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
 func toInt64(v interface{}) int64 {
 	switch val := v.(type) {
 	case int64:
