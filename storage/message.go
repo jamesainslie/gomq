@@ -139,6 +139,65 @@ func ReadBytesMessage(buf []byte) (*BytesMessage, error) {
 	}, nil
 }
 
+// ReadBytesMessageZeroCopy deserializes a BytesMessage from buf without copying
+// the body. String fields (exchange, routing key) are copied out as Go strings,
+// but Body aliases buf directly. The caller must not use Body after buf is
+// invalidated (e.g., after an mmap read lock is released).
+func ReadBytesMessageZeroCopy(buf []byte) (*BytesMessage, error) {
+	if len(buf) < MinMessageSize {
+		return nil, fmt.Errorf("buffer too small (%d < %d): %w", len(buf), MinMessageSize, ErrBoundsCheck)
+	}
+
+	pos := 0
+
+	timestamp := int64(binary.LittleEndian.Uint64(buf[pos:]))
+	pos += 8
+
+	exLen := int(buf[pos])
+	pos++
+	if pos+exLen > len(buf) {
+		return nil, fmt.Errorf("exchange name length %d exceeds buffer: %w", exLen, ErrBoundsCheck)
+	}
+	exchangeName := string(buf[pos : pos+exLen]) // string() copies
+	pos += exLen
+
+	rkLen := int(buf[pos])
+	pos++
+	if pos+rkLen > len(buf) {
+		return nil, fmt.Errorf("routing key length %d exceeds buffer: %w", rkLen, ErrBoundsCheck)
+	}
+	routingKey := string(buf[pos : pos+rkLen])
+	pos += rkLen
+
+	if pos+2 > len(buf) {
+		return nil, fmt.Errorf("buffer too small for properties flags: %w", ErrBoundsCheck)
+	}
+	flags := binary.BigEndian.Uint16(buf[pos:])
+	pos += 2
+
+	if pos+8 > len(buf) {
+		return nil, fmt.Errorf("buffer too small for body size: %w", ErrBoundsCheck)
+	}
+	bodySize := binary.LittleEndian.Uint64(buf[pos:])
+	pos += 8
+
+	if pos+int(bodySize) > len(buf) {
+		return nil, fmt.Errorf("body size %d exceeds buffer: %w", bodySize, ErrBoundsCheck)
+	}
+
+	// Zero-copy: body aliases the input buffer directly.
+	body := buf[pos : pos+int(bodySize)]
+
+	return &BytesMessage{
+		Timestamp:    timestamp,
+		ExchangeName: exchangeName,
+		RoutingKey:   routingKey,
+		Properties:   Properties{Flags: flags},
+		BodySize:     bodySize,
+		Body:         body,
+	}, nil
+}
+
 // SkipMessage returns the total byte size of the next message in buf without fully
 // deserializing it. This is used during segment recovery to count messages.
 func SkipMessage(buf []byte) (int, error) {
