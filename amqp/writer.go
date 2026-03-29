@@ -12,6 +12,18 @@ type Writer struct {
 	bw           *bufio.Writer
 	maxFrameSize int
 	scratch      []byte
+	methodBuf    []byte // reusable buffer for method/property encoding
+}
+
+// sliceWriter appends writes to a caller-owned byte slice, avoiding
+// intermediate allocations.
+type sliceWriter struct {
+	buf *[]byte
+}
+
+func (sw *sliceWriter) Write(p []byte) (int, error) {
+	*sw.buf = append(*sw.buf, p...)
+	return len(p), nil
 }
 
 // NewWriter creates a new frame writer with the given maximum frame size.
@@ -20,6 +32,7 @@ func NewWriter(w io.Writer, maxFrameSize int) *Writer {
 		bw:           bufio.NewWriter(w),
 		maxFrameSize: maxFrameSize,
 		scratch:      make([]byte, maxFrameSize),
+		methodBuf:    make([]byte, 0, maxFrameSize),
 	}
 }
 
@@ -27,21 +40,18 @@ func NewWriter(w io.Writer, maxFrameSize int) *Writer {
 func (w *Writer) WriteMethod(channel uint16, method Method) error {
 	// Encode the method payload: class(2) + method(2) + method_fields.
 	id := method.MethodID()
-	classID := uint16(id >> classShift)
-	methodID := uint16(id & methodMask)
+	binary.BigEndian.PutUint16(w.scratch[:sizeUint16], uint16(id>>classShift))
+	binary.BigEndian.PutUint16(w.scratch[sizeUint16:sizeUint32], uint16(id&methodMask))
 
-	// Write class and method IDs to scratch buffer.
-	binary.BigEndian.PutUint16(w.scratch[:sizeUint16], classID)
-	binary.BigEndian.PutUint16(w.scratch[sizeUint16:sizeUint32], methodID)
-
-	// Write method fields into a temporary buffer.
-	var methodBuf limitedBuffer
-	if err := method.Write(&methodBuf); err != nil {
+	// Reuse methodBuf to avoid per-call heap allocation.
+	w.methodBuf = w.methodBuf[:0]
+	sw := &sliceWriter{buf: &w.methodBuf}
+	if err := method.Write(sw); err != nil {
 		return fmt.Errorf("encode method %s: %w", method.MethodName(), err)
 	}
 
-	payloadSize := sizeUint32 + methodBuf.Len()
-	copy(w.scratch[sizeUint32:], methodBuf.Bytes())
+	payloadSize := sizeUint32 + len(w.methodBuf)
+	copy(w.scratch[sizeUint32:], w.methodBuf)
 
 	return w.writeFrame(FrameMethod, channel, w.scratch[:payloadSize])
 }
@@ -57,14 +67,15 @@ func (w *Writer) WriteHeader(channel, classID uint16, bodySize uint64, props *Pr
 	binary.BigEndian.PutUint64(w.scratch[off:], bodySize)
 	off += sizeUint64
 
-	// Write properties into a temporary buffer.
-	var propsBuf limitedBuffer
-	if err := props.Write(&propsBuf); err != nil {
+	// Reuse methodBuf to avoid per-call heap allocation for properties.
+	w.methodBuf = w.methodBuf[:0]
+	sw := &sliceWriter{buf: &w.methodBuf}
+	if err := props.Write(sw); err != nil {
 		return fmt.Errorf("encode header properties: %w", err)
 	}
 
-	copy(w.scratch[off:], propsBuf.Bytes())
-	off += propsBuf.Len()
+	copy(w.scratch[off:], w.methodBuf)
+	off += len(w.methodBuf)
 
 	return w.writeFrame(FrameHeader, channel, w.scratch[:off])
 }
@@ -122,16 +133,3 @@ func (w *Writer) writeFrame(frameType uint8, channel uint16, payload []byte) err
 	}
 	return nil
 }
-
-// limitedBuffer is a simple byte buffer used for intermediate encoding.
-type limitedBuffer struct {
-	buf []byte
-}
-
-func (lb *limitedBuffer) Write(p []byte) (int, error) {
-	lb.buf = append(lb.buf, p...)
-	return len(p), nil
-}
-
-func (lb *limitedBuffer) Bytes() []byte { return lb.buf }
-func (lb *limitedBuffer) Len() int      { return len(lb.buf) }
