@@ -19,6 +19,8 @@ func main() {
 	flag.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "Data directory for persistent storage")
 	flag.StringVar(&cfg.AMQPBind, "bind", cfg.AMQPBind, "AMQP bind address")
 	flag.IntVar(&cfg.AMQPPort, "port", cfg.AMQPPort, "AMQP listen port")
+	flag.StringVar(&cfg.HTTPBind, "http-bind", cfg.HTTPBind, "HTTP management API bind address")
+	flag.IntVar(&cfg.HTTPPort, "http-port", cfg.HTTPPort, "HTTP management API port (-1 to disable)")
 	flag.Parse()
 
 	if err := run(cfg); err != nil {
@@ -32,6 +34,8 @@ func run(cfg *config.Config) error {
 		gomq.WithDataDir(cfg.DataDir),
 		gomq.WithAMQPPort(cfg.AMQPPort),
 		gomq.WithBind(cfg.AMQPBind),
+		gomq.WithHTTPPort(cfg.HTTPPort),
+		gomq.WithHTTPBind(cfg.HTTPBind),
 	)
 	if err != nil {
 		return fmt.Errorf("create broker: %w", err)
@@ -40,8 +44,8 @@ func run(cfg *config.Config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Fprintf(os.Stderr, "gomq starting (data_dir=%s, amqp=%s:%d)\n",
-		cfg.DataDir, cfg.AMQPBind, cfg.AMQPPort)
+	fmt.Fprintf(os.Stderr, "gomq starting (data_dir=%s, amqp=%s:%d, http=%s:%d)\n",
+		cfg.DataDir, cfg.AMQPBind, cfg.AMQPPort, cfg.HTTPBind, cfg.HTTPPort)
 
 	if err := brk.ListenAndServe(ctx); err != nil {
 		return fmt.Errorf("serve: %w", err)

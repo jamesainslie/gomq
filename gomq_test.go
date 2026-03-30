@@ -13,7 +13,7 @@ func TestEmbeddedBroker(t *testing.T) {
 
 	dir := t.TempDir()
 
-	brk, err := gomq.New(gomq.WithDataDir(dir))
+	brk, err := gomq.New(gomq.WithDataDir(dir), gomq.WithHTTPPort(-1))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -73,6 +73,7 @@ func TestEmbeddedBroker_ListenAndServe(t *testing.T) {
 		gomq.WithDataDir(dir),
 		gomq.WithBind("127.0.0.1"),
 		gomq.WithAMQPPort(0),
+		gomq.WithHTTPPort(-1),
 	)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)

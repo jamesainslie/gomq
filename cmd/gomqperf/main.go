@@ -219,6 +219,7 @@ func startEmbeddedBroker(ctx context.Context, dataDir string) (string, func(), e
 		gomq.WithDataDir(dataDir),
 		gomq.WithAMQPPort(0),
 		gomq.WithBind("127.0.0.1"),
+		gomq.WithHTTPPort(-1),
 	)
 	if err != nil {
 		return "", nil, fmt.Errorf("create broker: %w", err)

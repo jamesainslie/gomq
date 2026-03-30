@@ -21,7 +21,7 @@ func startTestBroker(t *testing.T) *gomq.Broker {
 
 	dir := t.TempDir()
 
-	brk, err := gomq.New(gomq.WithDataDir(dir))
+	brk, err := gomq.New(gomq.WithDataDir(dir), gomq.WithHTTPPort(-1))
 	if err != nil {
 		t.Fatalf("gomq.New() error: %v", err)
 	}
