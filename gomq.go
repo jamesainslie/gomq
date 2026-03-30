@@ -8,20 +8,29 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"sync"
+	"time"
 
 	"github.com/jamesainslie/gomq/broker"
 	"github.com/jamesainslie/gomq/config"
+	mgmt "github.com/jamesainslie/gomq/http"
 )
+
+// httpReadHeaderTimeout is the maximum duration for reading HTTP
+// request headers on the management API.
+const httpReadHeaderTimeout = 10 * time.Second
 
 // Broker wraps a broker.Server with a clean embeddable API.
 type Broker struct {
 	server *broker.Server
 	cfg    *config.Config
+	api    *mgmt.API
 
-	mu   sync.Mutex
-	addr net.Addr
-	adCh chan struct{}
+	mu       sync.Mutex
+	addr     net.Addr
+	httpAddr net.Addr
+	adCh     chan struct{}
 }
 
 // Option configures a Broker.
@@ -48,11 +57,26 @@ func WithBind(addr string) Option {
 	}
 }
 
+// WithHTTPPort sets the HTTP management API port. Use 0 for a random port.
+// Use -1 to disable the HTTP API.
+func WithHTTPPort(port int) Option {
+	return func(c *config.Config) {
+		c.HTTPPort = port
+	}
+}
+
+// WithHTTPBind sets the HTTP management API bind address.
+func WithHTTPBind(addr string) Option {
+	return func(c *config.Config) {
+		c.HTTPBind = addr
+	}
+}
+
 // New creates a broker with the given options applied to default config.
 func New(opts ...Option) (*Broker, error) {
 	cfg := config.Default()
-	for _, o := range opts {
-		o(cfg)
+	for _, opt := range opts {
+		opt(cfg)
 	}
 
 	srv, err := broker.NewServer(cfg)
@@ -60,15 +84,19 @@ func New(opts ...Option) (*Broker, error) {
 		return nil, fmt.Errorf("create broker server: %w", err)
 	}
 
+	api := mgmt.NewAPI(srv, srv.Users())
+
 	return &Broker{
 		server: srv,
 		cfg:    cfg,
+		api:    api,
 		adCh:   make(chan struct{}),
 	}, nil
 }
 
 // ListenAndServe binds to the configured address and port, then serves
-// connections until the context is cancelled.
+// connections until the context is cancelled. Also starts the HTTP
+// management API if configured.
 func (b *Broker) ListenAndServe(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", b.cfg.AMQPBind, b.cfg.AMQPPort)
 
@@ -83,18 +111,68 @@ func (b *Broker) ListenAndServe(ctx context.Context) error {
 
 // Serve accepts connections on the given listener until the context is
 // cancelled. The listener address is available via [Broker.Addr] after
-// this method is called.
+// this method is called. Also starts the HTTP management API if configured.
 func (b *Broker) Serve(ctx context.Context, ln net.Listener) error {
 	b.setAddr(ln.Addr())
+
+	// Start HTTP management API if port is not -1.
+	if b.cfg.HTTPPort >= 0 {
+		if err := b.startHTTP(ctx); err != nil {
+			return fmt.Errorf("start http api: %w", err)
+		}
+	}
+
 	return b.server.Serve(ctx, ln)
 }
 
-// Addr returns the listener address, or nil if the broker is not yet
+// startHTTP starts the HTTP management API listener.
+func (b *Broker) startHTTP(ctx context.Context) error {
+	httpAddr := fmt.Sprintf("%s:%d", b.cfg.HTTPBind, b.cfg.HTTPPort)
+
+	lc := net.ListenConfig{}
+	httpLn, err := lc.Listen(ctx, "tcp", httpAddr)
+	if err != nil {
+		return fmt.Errorf("listen http on %s: %w", httpAddr, err)
+	}
+
+	b.mu.Lock()
+	b.httpAddr = httpLn.Addr()
+	b.mu.Unlock()
+
+	httpServer := &http.Server{
+		Handler:           b.api.Handler(),
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+	}
+
+	go func() {
+		<-ctx.Done()
+		_ = httpServer.Close() //nolint:errcheck // shutting down
+	}()
+
+	go func() {
+		if serveErr := httpServer.Serve(httpLn); serveErr != nil && serveErr != http.ErrServerClosed {
+			// Best-effort HTTP server; AMQP serve loop is the primary.
+			_ = serveErr //nolint:errcheck // best-effort HTTP server
+		}
+	}()
+
+	return nil
+}
+
+// Addr returns the AMQP listener address, or nil if the broker is not yet
 // listening.
 func (b *Broker) Addr() net.Addr {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.addr
+}
+
+// HTTPAddr returns the HTTP management API listener address, or nil if
+// the API is not running.
+func (b *Broker) HTTPAddr() net.Addr {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.httpAddr
 }
 
 // WaitForAddr blocks until the broker starts listening or the context
