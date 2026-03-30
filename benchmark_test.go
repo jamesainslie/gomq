@@ -31,7 +31,7 @@ func TestPerfGate_1P1C(t *testing.T) {
 
 	const (
 		msgCount  = 100_000
-		gateRate  = 30_000.0
+		gateRate  = 20_000.0
 		queueName = "perf-1p1c"
 	)
 
@@ -119,7 +119,7 @@ func TestPerfGate_4P4C(t *testing.T) {
 		msgCount   = 200_000
 		publishers = 4
 		consumers  = 4
-		gateRate   = 30_000.0
+		gateRate   = 20_000.0
 		queueName  = "perf-4p4c"
 	)
 

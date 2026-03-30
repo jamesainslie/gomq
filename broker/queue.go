@@ -697,6 +697,11 @@ func (q *Queue) resetExpireTimer() {
 // the per-message expiration. Must be called with q.mu held (or at a point
 // where the message is already shifted and owned by the caller).
 func (q *Queue) isExpired(msg *storage.BytesMessage) bool {
+	// Fast path: no TTL configured and no per-message expiration.
+	if q.messageTTL <= 0 && msg.Properties.Expiration == "" {
+		return false
+	}
+
 	now := time.Now().UnixMilli()
 	age := now - msg.Timestamp
 

@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -188,27 +189,24 @@ func (c *Consumer) waitForPriority(ctx context.Context) bool {
 		return true
 	}
 
+	// Only check if there are actually higher-priority consumers.
 	c.queue.mu.RLock()
-	consumers := make([]*consumerStub, len(c.queue.consumers))
-	copy(consumers, c.queue.consumers)
-	c.queue.mu.RUnlock()
-
-	for _, other := range consumers {
+	hasHigher := false
+	for _, other := range c.queue.consumers {
 		if other.Priority > c.priority && other.hasCapacity() {
-			// Higher-priority consumer has capacity — yield briefly
-			// so it can take the message instead.
-			const priorityYieldDuration = time.Millisecond
-			select {
-			case <-ctx.Done():
-				return false
-			default:
-				// Small yield to let higher-priority goroutine proceed.
-				time.Sleep(priorityYieldDuration)
-				return true // re-enter the loop and re-check
-			}
+			hasHigher = true
+			break
 		}
 	}
-	return true
+	c.queue.mu.RUnlock()
+
+	if !hasHigher {
+		return true
+	}
+
+	// Yield once via runtime to let higher-priority goroutine proceed.
+	runtime.Gosched()
+	return ctx.Err() == nil
 }
 
 // waitForCapacity blocks until the consumer has prefetch capacity or the
