@@ -6,6 +6,7 @@ package gomq
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -27,10 +28,11 @@ type Broker struct {
 	cfg    *config.Config
 	api    *mgmt.API
 
-	mu       sync.Mutex
-	addr     net.Addr
-	httpAddr net.Addr
-	adCh     chan struct{}
+	mu        sync.Mutex
+	addr      net.Addr
+	httpAddr  net.Addr
+	amqpsAddr net.Addr
+	adCh      chan struct{}
 }
 
 // Option configures a Broker.
@@ -69,6 +71,21 @@ func WithHTTPPort(port int) Option {
 func WithHTTPBind(addr string) Option {
 	return func(c *config.Config) {
 		c.HTTPBind = addr
+	}
+}
+
+// WithTLS sets the TLS certificate and key file paths for AMQPS.
+func WithTLS(certFile, keyFile string) Option {
+	return func(c *config.Config) {
+		c.TLSCertFile = certFile
+		c.TLSKeyFile = keyFile
+	}
+}
+
+// WithAMQPSPort sets the AMQPS (TLS) listener port. Use -1 to disable.
+func WithAMQPSPort(port int) Option {
+	return func(c *config.Config) {
+		c.AMQPSPort = port
 	}
 }
 
@@ -111,7 +128,8 @@ func (b *Broker) ListenAndServe(ctx context.Context) error {
 
 // Serve accepts connections on the given listener until the context is
 // cancelled. The listener address is available via [Broker.Addr] after
-// this method is called. Also starts the HTTP management API if configured.
+// this method is called. Also starts the HTTP management API and AMQPS
+// listener if configured.
 func (b *Broker) Serve(ctx context.Context, ln net.Listener) error {
 	b.setAddr(ln.Addr())
 
@@ -122,7 +140,51 @@ func (b *Broker) Serve(ctx context.Context, ln net.Listener) error {
 		}
 	}
 
+	// Start AMQPS listener if TLS is configured and port is not -1.
+	if b.cfg.TLSCertFile != "" && b.cfg.TLSKeyFile != "" && b.cfg.AMQPSPort >= 0 {
+		if err := b.startAMQPS(ctx); err != nil {
+			return fmt.Errorf("start amqps: %w", err)
+		}
+	}
+
 	return b.server.Serve(ctx, ln)
+}
+
+// startAMQPS starts the AMQPS (TLS) listener.
+func (b *Broker) startAMQPS(ctx context.Context) error {
+	tlsCfg, err := b.server.TLSConfig()
+	if err != nil {
+		return fmt.Errorf("create TLS config: %w", err)
+	}
+
+	addr := fmt.Sprintf("%s:%d", b.cfg.AMQPBind, b.cfg.AMQPSPort)
+
+	lc := net.ListenConfig{}
+	tcpLn, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen amqps on %s: %w", addr, err)
+	}
+
+	tlsLn := tls.NewListener(tcpLn, tlsCfg)
+
+	b.mu.Lock()
+	b.amqpsAddr = tlsLn.Addr()
+	b.mu.Unlock()
+
+	go func() {
+		// Serve blocks until the context is cancelled; ignore the error
+		// since the plain AMQP Serve loop is the primary.
+		_ = b.server.Serve(ctx, tlsLn) //nolint:errcheck // secondary TLS listener
+	}()
+
+	return nil
+}
+
+// AMQPSAddr returns the AMQPS listener address, or nil if TLS is not running.
+func (b *Broker) AMQPSAddr() net.Addr {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.amqpsAddr
 }
 
 // startHTTP starts the HTTP management API listener.
