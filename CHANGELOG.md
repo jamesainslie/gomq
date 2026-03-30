@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- TLS/AMQPS support with configurable cert/key and `--tls-cert`, `--tls-key`, `--amqps-port` flags
+- `WithTLS` and `WithAMQPSPort` options for the embeddable broker API
+- Policy system with regex pattern matching, priority-based resolution, and automatic reapplication
+- HTTP API for policies: `GET/PUT/DELETE /api/policies/{vhost}/{name}`
+- Per-vhost connection and queue limits (`max-connections`, `max-queues`)
+- HTTP API for vhost limits: `GET/PUT/DELETE /api/vhost-limits/{vhost}`
+- INI config file support (`--config` flag) with LavinMQ-compatible `[main]`, `[amqp]`, `[mgmt]` sections
 - Priority queue support via `x-max-priority` queue argument (1-255 levels, per-priority stores, highest-first delivery)
 - Stream queue type via `x-queue-type=stream` (append-only log, per-consumer offsets, ack is no-op, supports first/last/next/numeric offset specifiers)
 - Consistent-hash exchange type (`x-consistent-hash`) with CRC32 hash ring and weighted virtual nodes
