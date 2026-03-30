@@ -657,6 +657,7 @@ func storagePropsToAMQP(sp storage.Properties) amqp.Properties {
 	return amqp.Properties{
 		Headers:    headerMapToTable(sp.Headers),
 		Expiration: sp.Expiration,
+		Priority:   sp.Priority,
 	}
 }
 
@@ -666,6 +667,7 @@ func amqpPropsToStorage(ap amqp.Properties) storage.Properties {
 		Flags:      ap.Flags(),
 		Headers:    tableToHeaderMap(ap.Headers),
 		Expiration: ap.Expiration,
+		Priority:   ap.Priority,
 	}
 }
 

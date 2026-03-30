@@ -16,6 +16,9 @@ import (
 
 const defaultSegmentSize = 8 * 1024 * 1024 // 8 MiB
 
+// maxPriorityLimit is the maximum value for x-max-priority.
+const maxPriorityLimit = 255
+
 // Overflow policy values for x-overflow argument.
 const (
 	overflowDropHead = "drop-head"
@@ -73,6 +76,12 @@ type Queue struct {
 	deliveryLimit    int64            // x-delivery-limit, 0 = unlimited
 	deliveryCounters map[string]int64 // maps message segment position string to count
 
+	// Priority queue: when maxPriority > 0, messages are stored in per-priority
+	// stores and delivered highest-priority first.
+	maxPriority    uint8                   // 0 = normal queue, 1-255 = priority queue
+	priorityStores []*storage.MessageStore // index = priority level (0..maxPriority)
+	ackStores      map[string]*storage.MessageStore
+
 	// Limits parsed from arguments.
 	maxLength      int64  // 0 = unlimited (x-max-length)
 	maxLengthBytes int64  // 0 = unlimited (x-max-length-bytes)
@@ -124,14 +133,9 @@ var (
 
 // NewQueue creates a queue backed by a MessageStore in dataDir/queues/<name>/.
 // Arguments are parsed for x-max-length, x-max-length-bytes, x-message-ttl,
-// and x-overflow.
+// x-overflow, and x-max-priority.
 func NewQueue(name string, durable, exclusive, autoDelete bool, args map[string]interface{}, dataDir string) (*Queue, error) {
 	queueDir := filepath.Join(dataDir, "queues", name)
-
-	store, err := storage.OpenMessageStore(queueDir, defaultSegmentSize)
-	if err != nil {
-		return nil, fmt.Errorf("open message store for queue %q: %w", name, err)
-	}
 
 	queue := &Queue{
 		name:       name,
@@ -139,7 +143,6 @@ func NewQueue(name string, durable, exclusive, autoDelete bool, args map[string]
 		exclusive:  exclusive,
 		autoDelete: autoDelete,
 		arguments:  args,
-		store:      store,
 		dataDir:    queueDir,
 		msgNotify:  make(chan struct{}, 1),
 		inbox:      make(chan *storage.Message, inboxCapacity),
@@ -147,6 +150,30 @@ func NewQueue(name string, durable, exclusive, autoDelete bool, args map[string]
 	}
 
 	queue.parseArguments(args)
+
+	if queue.maxPriority > 0 {
+		// Priority queue: create one store per priority level (0..maxPriority).
+		queue.ackStores = make(map[string]*storage.MessageStore)
+		queue.priorityStores = make([]*storage.MessageStore, queue.maxPriority+1)
+		for level := range queue.priorityStores {
+			pDir := filepath.Join(queueDir, fmt.Sprintf("priority-%d", level))
+			ps, err := storage.OpenMessageStore(pDir, defaultSegmentSize)
+			if err != nil {
+				// Close any stores already opened.
+				for prev := range level {
+					_ = queue.priorityStores[prev].Close()
+				}
+				return nil, fmt.Errorf("open priority store %d for queue %q: %w", level, name, err)
+			}
+			queue.priorityStores[level] = ps
+		}
+	} else {
+		store, err := storage.OpenMessageStore(queueDir, defaultSegmentSize)
+		if err != nil {
+			return nil, fmt.Errorf("open message store for queue %q: %w", name, err)
+		}
+		queue.store = store
+	}
 
 	queue.inboxWg.Add(1)
 	go queue.writeLoop()
@@ -183,7 +210,7 @@ func (q *Queue) Publish(msg *storage.Message) (bool, error) {
 		return false, ErrQueueClosed
 	}
 
-	if q.overflow == overflowReject && q.maxLength > 0 && int64(q.store.Len()) >= q.maxLength {
+	if q.overflow == overflowReject && q.maxLength > 0 && int64(q.totalLen()) >= q.maxLength {
 		return false, nil
 	}
 
@@ -216,21 +243,22 @@ func (q *Queue) PublishSync(msg *storage.Message) (bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if q.maxLength > 0 && int64(q.store.Len()) >= q.maxLength {
+	if q.maxLength > 0 && int64(q.totalLen()) >= q.maxLength {
 		if q.overflow == overflowReject {
 			return false, nil
 		}
 		_ = q.dropHead() //nolint:errcheck // best-effort overflow eviction
 	}
 
-	if q.maxLengthBytes > 0 && int64(q.store.ByteSize()) >= q.maxLengthBytes { //nolint:gosec // ByteSize practically bounded well below MaxInt64
+	if q.maxLengthBytes > 0 && int64(q.totalByteSize()) >= q.maxLengthBytes { //nolint:gosec // ByteSize practically bounded well below MaxInt64
 		if q.overflow == overflowReject {
 			return false, nil
 		}
 		_ = q.dropHead() //nolint:errcheck // best-effort overflow eviction
 	}
 
-	if _, err := q.store.Push(msg); err != nil {
+	store := q.priorityStore(msg.Properties.Priority)
+	if _, err := store.Push(msg); err != nil {
 		return false, fmt.Errorf("write message to store: %w", err)
 	}
 
@@ -292,11 +320,51 @@ func (q *Queue) writeLoop() {
 	}
 }
 
+// priorityStore returns the MessageStore for the given message priority.
+// If this is not a priority queue, it returns the single store.
+// Must be called with q.mu held or during construction.
+func (q *Queue) priorityStore(priority uint8) *storage.MessageStore {
+	if q.maxPriority == 0 {
+		return q.store
+	}
+	p := priority
+	if p > q.maxPriority {
+		p = q.maxPriority
+	}
+	return q.priorityStores[p]
+}
+
+// totalLen returns the total message count across all stores. Must be called
+// with q.mu held.
+func (q *Queue) totalLen() uint32 {
+	if q.maxPriority == 0 {
+		return q.store.Len()
+	}
+	var total uint32
+	for _, ps := range q.priorityStores {
+		total += ps.Len()
+	}
+	return total
+}
+
+// totalByteSize returns the total byte size across all stores. Must be called
+// with q.mu held.
+func (q *Queue) totalByteSize() uint64 {
+	if q.maxPriority == 0 {
+		return q.store.ByteSize()
+	}
+	var total uint64
+	for _, ps := range q.priorityStores {
+		total += ps.ByteSize()
+	}
+	return total
+}
+
 // publishToStore writes a single message to the store, enforcing overflow
 // limits. Must be called with q.mu held.
 func (q *Queue) publishToStore(msg *storage.Message) {
 	// Enforce max-length limit.
-	if q.maxLength > 0 && int64(q.store.Len()) >= q.maxLength {
+	if q.maxLength > 0 && int64(q.totalLen()) >= q.maxLength {
 		if q.overflow == overflowReject {
 			return
 		}
@@ -304,18 +372,20 @@ func (q *Queue) publishToStore(msg *storage.Message) {
 	}
 
 	// Enforce max-length-bytes limit.
-	if q.maxLengthBytes > 0 && int64(q.store.ByteSize()) >= q.maxLengthBytes { //nolint:gosec // ByteSize practically bounded well below MaxInt64
+	if q.maxLengthBytes > 0 && int64(q.totalByteSize()) >= q.maxLengthBytes { //nolint:gosec // ByteSize practically bounded well below MaxInt64
 		if q.overflow == overflowReject {
 			return
 		}
 		_ = q.dropHead() //nolint:errcheck // non-fatal; segment GC handles cleanup
 	}
 
-	_, _ = q.store.Push(msg) //nolint:errcheck // non-fatal for individual batch messages
+	store := q.priorityStore(msg.Properties.Priority)
+	_, _ = store.Push(msg) //nolint:errcheck // non-fatal for individual batch messages
 }
 
 // Get shifts one message from the front of the queue (basic.get semantics).
 // Requeued messages are served first with the Redelivered flag set.
+// For priority queues, messages are shifted from the highest-priority store first.
 // Expired messages are dead-lettered or deleted and silently skipped.
 // If noAck is true the message is considered immediately consumed. Returns
 // false when the queue is empty.
@@ -332,14 +402,15 @@ func (q *Queue) Get(noAck bool) (*storage.Envelope, bool) {
 			}
 			q.deliverCount.Add(1)
 			if noAck {
-				if delErr := q.store.Delete(env.SegmentPosition); delErr == nil {
+				store := q.storeForSP(env.SegmentPosition)
+				if delErr := store.Delete(env.SegmentPosition); delErr == nil {
 					q.ackCount.Add(1)
 				}
 			}
 			return env, true
 		}
 
-		env, ok := q.store.Shift()
+		env, ok := q.shiftPriority()
 		if !ok {
 			return nil, false
 		}
@@ -352,13 +423,52 @@ func (q *Queue) Get(noAck bool) (*storage.Envelope, bool) {
 		q.deliverCount.Add(1)
 
 		if noAck {
-			if delErr := q.store.Delete(env.SegmentPosition); delErr == nil {
+			store := q.storeForSP(env.SegmentPosition)
+			if delErr := store.Delete(env.SegmentPosition); delErr == nil {
 				q.ackCount.Add(1)
 			}
 		}
 
 		return env, true
 	}
+}
+
+// shiftPriority shifts a message from the highest-priority non-empty store.
+// For non-priority queues, this is equivalent to q.store.Shift().
+// Must be called with q.mu held.
+func (q *Queue) shiftPriority() (*storage.Envelope, bool) {
+	if q.maxPriority == 0 {
+		return q.store.Shift()
+	}
+	// Iterate from highest to lowest priority.
+	for i := int(q.maxPriority); i >= 0; i-- {
+		ps := q.priorityStores[i]
+		if env, ok := ps.Shift(); ok {
+			q.ackStores[env.SegmentPosition.String()] = ps
+			return env, true
+		}
+	}
+	return nil, false
+}
+
+// storeForSP returns the store that owns the given segment position.
+// For non-priority queues this is the single store. For priority queues,
+// the owning store is looked up from the ackStores tracking map.
+// Must be called with q.mu held.
+func (q *Queue) storeForSP(sp storage.SegmentPosition) *storage.MessageStore {
+	if q.maxPriority == 0 {
+		return q.store
+	}
+	if ps, ok := q.ackStores[sp.String()]; ok {
+		return ps
+	}
+	// Fallback: try each store (for requeued messages that may have lost tracking).
+	for _, ps := range q.priorityStores {
+		if _, err := ps.GetMessage(sp); err == nil {
+			return ps
+		}
+	}
+	return q.priorityStores[0]
 }
 
 // GetFunc shifts one message from the front of the queue and calls fn with the
@@ -385,11 +495,18 @@ func (q *Queue) GetFunc(noAck bool, fn func(env *storage.Envelope) error) (bool,
 			}
 			q.deliverCount.Add(1)
 			if noAck {
-				if delErr := q.store.Delete(env.SegmentPosition); delErr == nil {
+				store := q.storeForSP(env.SegmentPosition)
+				if delErr := store.Delete(env.SegmentPosition); delErr == nil {
 					q.ackCount.Add(1)
 				}
 			}
 			return true, nil
+		}
+
+		// For priority queues, use Shift-based path since we iterate across
+		// multiple stores.
+		if q.maxPriority > 0 {
+			return q.getFuncPriority(noAck, fn)
 		}
 
 		// Try the normal store path. ShiftFunc uses zero-copy reads under the
@@ -428,9 +545,45 @@ func (q *Queue) GetFunc(noAck bool, fn func(env *storage.Envelope) error) (bool,
 	}
 }
 
+// getFuncPriority handles GetFunc for priority queues by shifting from the
+// highest-priority non-empty store. Must be called with q.mu held.
+func (q *Queue) getFuncPriority(noAck bool, fn func(env *storage.Envelope) error) (bool, error) {
+	for {
+		env, ok := q.shiftPriority()
+		if !ok {
+			return false, nil
+		}
+
+		if q.isExpired(env.Message) {
+			store := q.storeForSP(env.SegmentPosition)
+			_ = q.deadLetterOrDeleteStore(store, env.SegmentPosition, "expired") //nolint:errcheck // best-effort
+			continue
+		}
+
+		if err := fn(env); err != nil {
+			q.requeued = append(q.requeued, env.SegmentPosition)
+			return false, err
+		}
+
+		q.deliverCount.Add(1)
+		if noAck {
+			store := q.storeForSP(env.SegmentPosition)
+			if delErr := store.Delete(env.SegmentPosition); delErr == nil {
+				q.ackCount.Add(1)
+			}
+		}
+		return true, nil
+	}
+}
+
 // Ack acknowledges a message, deleting it from the store.
 func (q *Queue) Ack(sp storage.SegmentPosition) error {
-	if err := q.store.Delete(sp); err != nil {
+	q.mu.Lock()
+	store := q.storeForSP(sp)
+	delete(q.ackStores, sp.String())
+	q.mu.Unlock()
+
+	if err := store.Delete(sp); err != nil {
 		return fmt.Errorf("ack message at %s: %w", sp, err)
 	}
 	q.ackCount.Add(1)
@@ -489,13 +642,20 @@ func (q *Queue) Reject(sp storage.SegmentPosition, requeue bool) error {
 // the front of the queue, returning the number actually purged.
 func (q *Queue) Purge(limit int) int {
 	q.Drain()
-	return q.store.Purge(limit)
+	if q.maxPriority == 0 {
+		return q.store.Purge(limit)
+	}
+	total := 0
+	for i := int(q.maxPriority); i >= 0 && total < limit; i-- {
+		total += q.priorityStores[i].Purge(limit - total)
+	}
+	return total
 }
 
 // Len returns the number of messages in the queue, including those
 // buffered in the async inbox that have not yet been written to the store.
 func (q *Queue) Len() uint32 {
-	return q.store.Len() + uint32(len(q.inbox)) //nolint:gosec // inbox capacity is 4096
+	return q.totalLen() + uint32(len(q.inbox)) //nolint:gosec // inbox capacity is 4096
 }
 
 // PublishCount returns the total number of messages published to this queue.
@@ -605,6 +765,16 @@ func (q *Queue) Close() error {
 	close(q.inbox)
 	q.inboxMu.Unlock()
 	q.inboxWg.Wait()
+
+	if q.maxPriority > 0 {
+		var firstErr error
+		for _, ps := range q.priorityStores {
+			if err := ps.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
 	return q.store.Close()
 }
 
@@ -742,7 +912,8 @@ func (q *Queue) shiftRequeued() (*storage.Envelope, bool) {
 		sp := q.requeued[len(q.requeued)-1]
 		q.requeued = q.requeued[:len(q.requeued)-1]
 
-		msg, err := q.store.GetMessage(sp)
+		store := q.storeForSP(sp)
+		msg, err := store.GetMessage(sp)
 		if err != nil {
 			// Message was already deleted or segment cleaned up; skip.
 			continue
@@ -757,28 +928,44 @@ func (q *Queue) shiftRequeued() (*storage.Envelope, bool) {
 	return nil, false
 }
 
-// dropHead shifts the oldest message from the store and either dead-letters
-// or deletes it depending on queue configuration.
+// dropHead shifts the oldest message from the lowest-priority non-empty store
+// and either dead-letters or deletes it depending on queue configuration.
 func (q *Queue) dropHead() error {
-	env, ok := q.store.Shift()
-	if !ok {
-		return nil
+	if q.maxPriority == 0 {
+		env, ok := q.store.Shift()
+		if !ok {
+			return nil
+		}
+		return q.deadLetterOrDelete(env.SegmentPosition, "maxlen")
 	}
-	return q.deadLetterOrDelete(env.SegmentPosition, "maxlen")
+	// For priority queues, drop from the lowest-priority non-empty store.
+	for i := range q.priorityStores {
+		env, ok := q.priorityStores[i].Shift()
+		if ok {
+			return q.deadLetterOrDeleteStore(q.priorityStores[i], env.SegmentPosition, "maxlen")
+		}
+	}
+	return nil
 }
 
 // deadLetterOrDelete republishes the message to the dead-letter exchange if
 // one is configured, then deletes it from the store. If no DLX is set, the
 // message is simply deleted. The reason is recorded in the x-death header.
 func (q *Queue) deadLetterOrDelete(sp storage.SegmentPosition, reason string) error {
+	store := q.storeForSP(sp)
+	return q.deadLetterOrDeleteStore(store, sp, reason)
+}
+
+// deadLetterOrDeleteStore performs dead-letter or delete on a specific store.
+func (q *Queue) deadLetterOrDeleteStore(store *storage.MessageStore, sp storage.SegmentPosition, reason string) error {
 	if q.deadLetterExchange == "" || q.vhost == nil {
-		return q.store.Delete(sp)
+		return store.Delete(sp)
 	}
 
-	msg, err := q.store.GetMessage(sp)
+	msg, err := store.GetMessage(sp)
 	if err != nil {
 		// Cannot read the message; just delete.
-		return q.store.Delete(sp)
+		return store.Delete(sp)
 	}
 
 	routingKey := q.deadLetterRoutingKey
@@ -817,7 +1004,7 @@ func (q *Queue) deadLetterOrDelete(sp storage.SegmentPosition, reason string) er
 	// Publish to the DLX; ignore routing errors (exchange may not exist).
 	_ = q.vhost.Publish(q.deadLetterExchange, routingKey, false, dlMsg) //nolint:errcheck // best-effort DLX delivery
 
-	return q.store.Delete(sp)
+	return store.Delete(sp)
 }
 
 // parseArguments extracts queue limits from the argument map.
@@ -861,6 +1048,16 @@ func (q *Queue) parseArguments(args map[string]interface{}) {
 		q.deliveryLimit = toInt64(v)
 		if q.deliveryLimit > 0 {
 			q.deliveryCounters = make(map[string]int64)
+		}
+	}
+
+	if v, ok := args["x-max-priority"]; ok {
+		p := toInt64(v)
+		if p > maxPriorityLimit {
+			p = maxPriorityLimit
+		}
+		if p > 0 {
+			q.maxPriority = uint8(p) //nolint:gosec // capped at 255 above
 		}
 	}
 }

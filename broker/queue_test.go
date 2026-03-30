@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -300,6 +301,156 @@ func TestQueue_PropertyAccessors(t *testing.T) {
 	}
 	if !queue.IsAutoDelete() {
 		t.Error("IsAutoDelete() = false, want true")
+	}
+}
+
+// --- Priority Queue Tests ---
+
+func TestQueue_PriorityHighFirst(t *testing.T) {
+	t.Parallel()
+	queue := newTestQueue(t, "prio-q", map[string]interface{}{
+		"x-max-priority": int64(10),
+	})
+
+	// Publish low-priority, then high-priority messages.
+	low := makeStorageMsg("", "", "low")
+	low.Properties.Priority = 1
+	if _, err := queue.PublishSync(low); err != nil {
+		t.Fatalf("Publish(low) error: %v", err)
+	}
+
+	high := makeStorageMsg("", "", "high")
+	high.Properties.Priority = 9
+	if _, err := queue.PublishSync(high); err != nil {
+		t.Fatalf("Publish(high) error: %v", err)
+	}
+
+	med := makeStorageMsg("", "", "med")
+	med.Properties.Priority = 5
+	if _, err := queue.PublishSync(med); err != nil {
+		t.Fatalf("Publish(med) error: %v", err)
+	}
+
+	// Get should return highest priority first.
+	env, ok := queue.Get(true)
+	if !ok {
+		t.Fatal("Get() returned false")
+	}
+	if string(env.Message.Body) != "high" {
+		t.Errorf("first Get() body = %q, want %q", env.Message.Body, "high")
+	}
+
+	env, ok = queue.Get(true)
+	if !ok {
+		t.Fatal("Get() returned false")
+	}
+	if string(env.Message.Body) != "med" {
+		t.Errorf("second Get() body = %q, want %q", env.Message.Body, "med")
+	}
+
+	env, ok = queue.Get(true)
+	if !ok {
+		t.Fatal("Get() returned false")
+	}
+	if string(env.Message.Body) != "low" {
+		t.Errorf("third Get() body = %q, want %q", env.Message.Body, "low")
+	}
+}
+
+func TestQueue_PriorityCappedAtMax(t *testing.T) {
+	t.Parallel()
+	queue := newTestQueue(t, "prio-cap-q", map[string]interface{}{
+		"x-max-priority": int64(5),
+	})
+
+	// Message with priority > max should be capped at max.
+	msg := makeStorageMsg("", "", "capped")
+	msg.Properties.Priority = 200
+	if _, err := queue.PublishSync(msg); err != nil {
+		t.Fatalf("Publish() error: %v", err)
+	}
+
+	normal := makeStorageMsg("", "", "normal")
+	normal.Properties.Priority = 5
+	if _, err := queue.PublishSync(normal); err != nil {
+		t.Fatalf("Publish() error: %v", err)
+	}
+
+	// Both should be at priority 5 — FIFO within same priority.
+	env, ok := queue.Get(true)
+	if !ok {
+		t.Fatal("Get() returned false")
+	}
+	if string(env.Message.Body) != "capped" {
+		t.Errorf("first Get() body = %q, want %q (same priority, FIFO)", env.Message.Body, "capped")
+	}
+}
+
+func TestQueue_PriorityDefaultZero(t *testing.T) {
+	t.Parallel()
+	queue := newTestQueue(t, "prio-zero-q", map[string]interface{}{
+		"x-max-priority": int64(10),
+	})
+
+	// Messages without explicit priority default to 0.
+	msg := makeStorageMsg("", "", "default-prio")
+	if _, err := queue.PublishSync(msg); err != nil {
+		t.Fatalf("Publish() error: %v", err)
+	}
+
+	env, ok := queue.Get(true)
+	if !ok {
+		t.Fatal("Get() returned false")
+	}
+	if string(env.Message.Body) != "default-prio" {
+		t.Errorf("Get() body = %q, want %q", env.Message.Body, "default-prio")
+	}
+}
+
+func TestQueue_PriorityLen(t *testing.T) {
+	t.Parallel()
+	queue := newTestQueue(t, "prio-len-q", map[string]interface{}{
+		"x-max-priority": int64(5),
+	})
+
+	for i := range 5 {
+		msg := makeStorageMsg("", "", "msg")
+		msg.Properties.Priority = uint8(i)
+		if _, err := queue.PublishSync(msg); err != nil {
+			t.Fatalf("Publish() error: %v", err)
+		}
+	}
+
+	if queue.Len() != 5 {
+		t.Errorf("Len() = %d, want 5", queue.Len())
+	}
+}
+
+func TestQueue_PriorityMixedInterleave(t *testing.T) {
+	t.Parallel()
+	queue := newTestQueue(t, "prio-mix-q", map[string]interface{}{
+		"x-max-priority": int64(3),
+	})
+
+	// Publish in mixed order.
+	for _, prio := range []uint8{0, 3, 1, 3, 2, 0} {
+		msg := makeStorageMsg("", "", fmt.Sprintf("p%d", prio))
+		msg.Properties.Priority = prio
+		if _, err := queue.PublishSync(msg); err != nil {
+			t.Fatalf("Publish() error: %v", err)
+		}
+	}
+
+	// Should drain from highest to lowest, FIFO within each level.
+	wantOrder := []string{"p3", "p3", "p2", "p1", "p0", "p0"}
+	for idx, wantBody := range wantOrder {
+		env, ok := queue.Get(true)
+		if !ok {
+			t.Fatalf("Get() #%d returned false", idx)
+		}
+		if string(env.Message.Body) != wantBody {
+			t.Errorf("Get() #%d body = %q, want %q", idx, env.Message.Body, wantBody)
+		}
 	}
 }
 

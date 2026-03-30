@@ -66,7 +66,7 @@ func TestMessage_ByteSize(t *testing.T) {
 				BodySize:     0,
 				Body:         nil,
 			},
-			want: 8 + 1 + 0 + 1 + 0 + 2 + 8 + 0 + 4 + 0 + 1 + 0, // ts + exlen + ex + rklen + rk + flags + bodysize + body + hdrssize + hdrs + explen + exp
+			want: 8 + 1 + 0 + 1 + 0 + 2 + 8 + 0 + 4 + 0 + 1 + 0 + 1, // ts + exlen + ex + rklen + rk + flags + bodysize + body + hdrssize + hdrs + explen + exp + priority
 		},
 		{
 			name: "with data",
@@ -78,7 +78,7 @@ func TestMessage_ByteSize(t *testing.T) {
 				BodySize:     5,
 				Body:         []byte("hello"),
 			},
-			want: 8 + 1 + 10 + 1 + 6 + 2 + 8 + 5 + 4 + 0 + 1 + 0,
+			want: 8 + 1 + 10 + 1 + 6 + 2 + 8 + 5 + 4 + 0 + 1 + 0 + 1,
 		},
 	}
 
@@ -131,6 +131,31 @@ func TestMessage_MinMessageSize(t *testing.T) {
 	}
 	if msg.ByteSize() != MinMessageSize {
 		t.Errorf("minimal message ByteSize() = %d, want MinMessageSize = %d", msg.ByteSize(), MinMessageSize)
+	}
+}
+
+func TestMessage_PriorityRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	msg := &Message{
+		Timestamp:    1711929600000,
+		ExchangeName: "amq.direct",
+		RoutingKey:   "test.key",
+		Properties:   Properties{Priority: 7},
+		BodySize:     5,
+		Body:         []byte("hello"),
+	}
+
+	buf := make([]byte, msg.ByteSize())
+	msg.MarshalTo(buf)
+
+	got, err := ReadBytesMessage(buf)
+	if err != nil {
+		t.Fatalf("ReadBytesMessage() error: %v", err)
+	}
+
+	if got.Properties.Priority != 7 {
+		t.Errorf("Priority = %d, want 7", got.Properties.Priority)
 	}
 }
 
