@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Priority queue support via `x-max-priority` queue argument (1-255 levels, per-priority stores, highest-first delivery)
+- Stream queue type via `x-queue-type=stream` (append-only log, per-consumer offsets, ack is no-op, supports first/last/next/numeric offset specifiers)
+- Consistent-hash exchange type (`x-consistent-hash`) with CRC32 hash ring and weighted virtual nodes
+- Message priority field (`Priority uint8`) in storage binary format and AMQP property mapping
 - HTTP management API (`/api/`) with RabbitMQ-compatible endpoints
 - Endpoints for overview, connections, channels, exchanges, queues, bindings, users, vhosts, permissions, and definitions
 - Prometheus metrics at `/api/metrics` and `/metrics` (queue depths, message rates, connection counts)
