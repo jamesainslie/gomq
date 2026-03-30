@@ -50,12 +50,12 @@ type FollowerConn struct {
 // NewReplicationServer creates a replication server that listens on
 // bind:port. The dataDir is used for full-sync file serving and the
 // password authenticates followers.
-func NewReplicationServer(bind string, port int, dataDir, password string) (*ReplicationServer, error) {
+func NewReplicationServer(ctx context.Context, bind string, port int, dataDir, password string) (*ReplicationServer, error) {
 	addr := fmt.Sprintf("%s:%d", bind, port)
 
 	lc := net.ListenConfig{}
 
-	listener, err := lc.Listen(context.Background(), "tcp", addr)
+	listener, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}

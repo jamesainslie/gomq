@@ -14,12 +14,12 @@ func TestReplicationServer_StartAndClose(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "test.dat"), []byte("data"))
 
-	rs, err := NewReplicationServer("127.0.0.1", 0, dir, "secret")
+	ctx, cancel := context.WithCancel(context.Background())
+
+	rs, err := NewReplicationServer(ctx, "127.0.0.1", 0, dir, "secret")
 	if err != nil {
 		t.Fatalf("NewReplicationServer: %v", err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	done := make(chan error, 1)
@@ -55,12 +55,12 @@ func TestReplicationServer_FollowerConnectsAndReceivesActions(t *testing.T) {
 
 	password := "test-password"
 
-	rs, err := NewReplicationServer("127.0.0.1", 0, leaderDir, password)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	rs, err := NewReplicationServer(ctx, "127.0.0.1", 0, leaderDir, password)
 	if err != nil {
 		t.Fatalf("NewReplicationServer: %v", err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go func() {
@@ -161,12 +161,12 @@ func TestReplicationServer_RejectsWrongPassword(t *testing.T) {
 
 	dir := t.TempDir()
 
-	rs, err := NewReplicationServer("127.0.0.1", 0, dir, "correct")
+	ctx, cancel := context.WithCancel(context.Background())
+
+	rs, err := NewReplicationServer(ctx, "127.0.0.1", 0, dir, "correct")
 	if err != nil {
 		t.Fatalf("NewReplicationServer: %v", err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go func() {
