@@ -186,7 +186,7 @@ func (st *Store) AddFederationLink(cfg *FederationConfig) error {
 		}
 	}
 
-	localURI := "amqp://guest:guest@127.0.0.1:5672/"
+	localURI := "amqp://guest:guest@127.0.0.1:5672/" //nolint:gosec // default local broker URI, not a secret
 	shvl := NewFederationLinkFromConfig(cfg, localURI)
 	st.fedLinks[cfg.Name] = shvl
 	st.fedConfigs[cfg.Name] = cfg
@@ -335,7 +335,7 @@ func (st *Store) loadFederation() error {
 	}
 	for _, cfg := range configs {
 		st.fedConfigs[cfg.Name] = cfg
-		localURI := "amqp://guest:guest@127.0.0.1:5672/"
+		localURI := "amqp://guest:guest@127.0.0.1:5672/" //nolint:gosec // default local broker URI, not a secret
 		st.fedLinks[cfg.Name] = NewFederationLinkFromConfig(cfg, localURI)
 	}
 	return nil
