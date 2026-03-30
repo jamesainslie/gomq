@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jamesainslie/gomq/amqp"
 	"github.com/jamesainslie/gomq/auth"
 	"github.com/jamesainslie/gomq/config"
 )
@@ -94,6 +96,38 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return s.Serve(ctx, listener)
 }
 
+// TLSConfig builds a *tls.Config from the server's certificate and key paths.
+// Returns an error if TLS is not configured or the certificate cannot be loaded.
+func (s *Server) TLSConfig() (*tls.Config, error) {
+	if s.cfg.TLSCertFile == "" || s.cfg.TLSKeyFile == "" {
+		return nil, errors.New("TLS certificate and key paths are required")
+	}
+
+	cert, err := tls.LoadX509KeyPair(s.cfg.TLSCertFile, s.cfg.TLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load TLS key pair: %w", err)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+// ServeTLS accepts TLS connections on the given listener. The listener
+// receives raw TCP connections; TLS handshaking is handled per-connection.
+// Both TLS and plain connections use the same handleConn path.
+func (s *Server) ServeTLS(ctx context.Context, listener net.Listener) error {
+	tlsCfg, err := s.TLSConfig()
+	if err != nil {
+		return fmt.Errorf("create TLS config: %w", err)
+	}
+
+	tlsListener := tls.NewListener(listener, tlsCfg)
+
+	return s.Serve(ctx, tlsListener)
+}
+
 // Close shuts down all connections and vhosts. Safe to call multiple times.
 func (s *Server) Close() error {
 	s.mu.Lock()
@@ -148,10 +182,38 @@ func (s *Server) handleConn(_ context.Context, netConn net.Conn) {
 		return
 	}
 
+	// Check vhost connection limit after handshake (when vhost is known).
+	if conn.vhost != nil {
+		vhostConnCount := s.countVHostConnections(conn.vhost.Name())
+		if err := conn.vhost.CheckConnectionLimit(vhostConnCount); err != nil {
+			// Reject: too many connections for this vhost.
+			_ = conn.sendFrame(0, &amqp.ConnectionClose{ //nolint:errcheck // best-effort rejection
+				ReplyCode: amqp.NotAllowed,
+				ReplyText: "max connections limit reached for vhost",
+			})
+			return
+		}
+	}
+
 	// Run the read loop until the connection closes or errors.
 	// ReadLoop returns nil on graceful close and error on protocol faults;
 	// in both cases the deferred cleanup closes the connection.
 	_ = conn.ReadLoop() //nolint:errcheck,contextcheck // handled by deferred close; consumers manage own contexts
+}
+
+// countVHostConnections counts the number of connections using the named vhost.
+func (s *Server) countVHostConnections(vhostName string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	count := 0
+	for conn := range s.conns {
+		if conn.VHostName() == vhostName {
+			count++
+		}
+	}
+
+	return count
 }
 
 // startDiskChecker starts a goroutine that periodically checks available

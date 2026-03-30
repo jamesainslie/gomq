@@ -8,6 +8,7 @@ const (
 	DefaultDataDir                     = "/var/lib/gomq"
 	DefaultAMQPBind                    = "127.0.0.1"
 	DefaultAMQPPort                    = 5672
+	DefaultAMQPSPort                   = -1 // disabled by default, 5671 when TLS is configured
 	DefaultHTTPBind                    = "127.0.0.1"
 	DefaultHTTPPort                    = 15672
 	DefaultHeartbeat                   = 300 * time.Second
@@ -29,6 +30,9 @@ type Config struct {
 	DataDir                 string
 	AMQPBind                string
 	AMQPPort                int
+	AMQPSPort               int // AMQPS (TLS) port; -1 to disable
+	TLSCertFile             string
+	TLSKeyFile              string
 	HTTPBind                string
 	HTTPPort                int
 	Heartbeat               time.Duration
@@ -55,6 +59,7 @@ func Default() *Config {
 		DataDir:                 DefaultDataDir,
 		AMQPBind:                DefaultAMQPBind,
 		AMQPPort:                DefaultAMQPPort,
+		AMQPSPort:               DefaultAMQPSPort,
 		HTTPBind:                DefaultHTTPBind,
 		HTTPPort:                DefaultHTTPPort,
 		Heartbeat:               DefaultHeartbeat,
