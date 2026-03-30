@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- MQTT 3.1.1 protocol support with full packet codec (all 14 control packet types)
+- MQTT broker bridging to AMQP via `amq.topic` exchange with topic conversion (`/` to `.`, `+` to `*`)
+- MQTT QoS 0, QoS 1 (PUBACK), and QoS 2 (PUBREC/PUBREL/PUBCOMP) message delivery
+- MQTT retained messages with delivery to new subscribers
+- MQTT Last Will and Testament (LWT) on ungraceful disconnect
+- MQTT clean and persistent sessions with per-client AMQP queues (`mqtt.<clientID>`)
+- MQTT wildcard subscription matching (`+` single-level, `#` multi-level)
+- MQTT keep-alive with PINGREQ/PINGRESP
+- MQTT authentication via the AMQP user store (username/password)
+- `WithMQTTPort` and `WithMQTTBind` options for the embeddable broker API
+- `--mqtt-port` and `--mqtt-bind` CLI flags (default 127.0.0.1:1883, -1 to disable)
+- `[mqtt]` INI config section with `bind` and `port` keys
+- Cross-protocol integration: AMQP publish delivered to MQTT subscribers and vice versa
 - TLS/AMQPS support with configurable cert/key and `--tls-cert`, `--tls-key`, `--amqps-port` flags
 - `WithTLS` and `WithAMQPSPort` options for the embeddable broker API
 - Policy system with regex pattern matching, priority-based resolution, and automatic reapplication

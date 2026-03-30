@@ -16,6 +16,7 @@ import (
 	"github.com/jamesainslie/gomq/broker"
 	"github.com/jamesainslie/gomq/config"
 	mgmt "github.com/jamesainslie/gomq/http"
+	mqttpkg "github.com/jamesainslie/gomq/mqtt"
 )
 
 // httpReadHeaderTimeout is the maximum duration for reading HTTP
@@ -27,11 +28,13 @@ type Broker struct {
 	server *broker.Server
 	cfg    *config.Config
 	api    *mgmt.API
+	mqtt   *mqttpkg.Broker
 
 	mu        sync.Mutex
 	addr      net.Addr
 	httpAddr  net.Addr
 	amqpsAddr net.Addr
+	mqttAddr  net.Addr
 	adCh      chan struct{}
 }
 
@@ -89,6 +92,21 @@ func WithAMQPSPort(port int) Option {
 	}
 }
 
+// WithMQTTPort sets the MQTT listener port. Use 0 for a random port.
+// Use -1 to disable the MQTT listener.
+func WithMQTTPort(port int) Option {
+	return func(c *config.Config) {
+		c.MQTTPort = port
+	}
+}
+
+// WithMQTTBind sets the MQTT bind address.
+func WithMQTTBind(addr string) Option {
+	return func(c *config.Config) {
+		c.MQTTBind = addr
+	}
+}
+
 // New creates a broker with the given options applied to default config.
 func New(opts ...Option) (*Broker, error) {
 	cfg := config.Default()
@@ -103,10 +121,15 @@ func New(opts ...Option) (*Broker, error) {
 
 	api := mgmt.NewAPI(srv, srv.Users())
 
+	// Get the default vhost for the MQTT broker bridge.
+	defaultVHost, _ := srv.GetVHost("/")
+	mqttBrk := mqttpkg.NewBroker(defaultVHost, srv.Users())
+
 	return &Broker{
 		server: srv,
 		cfg:    cfg,
 		api:    api,
+		mqtt:   mqttBrk,
 		adCh:   make(chan struct{}),
 	}, nil
 }
@@ -131,8 +154,6 @@ func (b *Broker) ListenAndServe(ctx context.Context) error {
 // this method is called. Also starts the HTTP management API and AMQPS
 // listener if configured.
 func (b *Broker) Serve(ctx context.Context, ln net.Listener) error {
-	b.setAddr(ln.Addr())
-
 	// Start HTTP management API if port is not -1.
 	if b.cfg.HTTPPort >= 0 {
 		if err := b.startHTTP(ctx); err != nil {
@@ -146,6 +167,18 @@ func (b *Broker) Serve(ctx context.Context, ln net.Listener) error {
 			return fmt.Errorf("start amqps: %w", err)
 		}
 	}
+
+	// Start MQTT listener if port is not -1.
+	if b.cfg.MQTTPort >= 0 {
+		if err := b.startMQTT(ctx); err != nil {
+			return fmt.Errorf("start mqtt: %w", err)
+		}
+	}
+
+	// Signal that the broker is ready. This must happen after all
+	// auxiliary listeners (HTTP, AMQPS, MQTT) are started so that
+	// callers waiting on WaitForAddr can safely read MQTTAddr, etc.
+	b.setAddr(ln.Addr())
 
 	return b.server.Serve(ctx, ln)
 }
@@ -185,6 +218,29 @@ func (b *Broker) AMQPSAddr() net.Addr {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.amqpsAddr
+}
+
+// startMQTT starts the MQTT listener.
+func (b *Broker) startMQTT(ctx context.Context) error {
+	mqttAddr := fmt.Sprintf("%s:%d", b.cfg.MQTTBind, b.cfg.MQTTPort)
+
+	addr, err := b.mqtt.ListenAndServe(ctx, mqttAddr)
+	if err != nil {
+		return fmt.Errorf("mqtt listen on %s: %w", mqttAddr, err)
+	}
+
+	b.mu.Lock()
+	b.mqttAddr = addr
+	b.mu.Unlock()
+
+	return nil
+}
+
+// MQTTAddr returns the MQTT listener address, or nil if MQTT is not running.
+func (b *Broker) MQTTAddr() net.Addr {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.mqttAddr
 }
 
 // startHTTP starts the HTTP management API listener.
